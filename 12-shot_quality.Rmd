@@ -1,0 +1,281 @@
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE)
+```
+
+# Quantifying Shooting Ability {#shot-quality}
+
+__Note that all the ```R``` code used in this book is accessible on [GitHub](https://github.com/olivierchabot17/ballbook).__
+
+```{r}
+# Load libraries
+library(tidyverse)
+library(sf)
+library(mgcv)
+library(broom)
+library(kableExtra)
+library(ggrepel)
+library(gridExtra)
+
+# Load the plot_court() function from the previous chapters
+source("code/court_themes.R")
+source("code/fiba_court_points.R")
+# Load the different zone polygon objects
+source("code/zone_polygons.R")
+
+# Load the larger dataset
+shots_tb <- readRDS(file = "data/shots_3000_tb.rds")
+
+# Load large spatial shots data
+shots_sf <- readRDS(file = "data/shots_3000_sf.rds")
+
+range_cut_off <- 8.5
+
+# Data is too sparse past 9 meters
+near_shots = shots_tb[shots_tb$dist_meters < range_cut_off, ]
+
+# Data is too sparse below backboard
+near_shots = near_shots[near_shots$loc_y >= backboard_offset - backboard_thick, ]
+
+# Define the window as an sf object
+near_window <- st_crop(
+    st_sfc(st_buffer(hoop_center, dist = range_cut_off)),
+    xmin = 0, ymin = backboard_offset - backboard_thick,
+    xmax = width, ymax = height
+  )
+```
+
+We will use our GAM models from the previous chapter to try separate a player's ability to make shots from the quality of the shots the are taking. This line of thinking was heavily influenced by Yu-Han Chang et al.'s paper [Quantifying Shot Quality in the NBA](https://docplayer.net/52631681-Quantifying-shot-quality-in-the-nba.html). In our case, we will define __shot quality__ as the number of points the average player in the sample can expect for a specific shot. 
+
+We can use our model that only considered the location of the shot to predict the probability of a made shot for a specific location. The expected points per shots can then be obtained by multiplying the probability by the number of points the shot would generate^[two or three points depending on the location of the shot].
+
+```{r, echo = TRUE, cache = TRUE}
+# GAM model based on shot coordinates
+coord_mod <- gam(
+  shot_made_numeric ~ s(loc_x, loc_y),
+  data = near_shots, method = "REML", family = binomial)
+```
+
+```{r}
+coord_df <- augment(coord_mod, type.predict = "response") %>%
+  inner_join(near_shots) %>%
+  mutate(
+    make_prob = .fitted,
+    se_prob = .se.fit,
+    actual_points = shot_made_numeric * shot_value,
+    x_points = .fitted * shot_value
+  )
+
+set.seed(123)
+samp_tb <- coord_df %>%
+  sample_n(10) %>%
+  select(dist_feet, shot_value, make_prob, x_points, actual_points)
+```
+
+```{r sq-tab, tidy=FALSE, echo = FALSE}
+knitr::kable(
+  samp_tb,
+  digits = 3,
+  caption = 'Expected Points as a measure of shot quality',
+  booktabs = TRUE
+)
+```
+
+Table \@ref(tab:sq-tab) displays the make probability and expected points per shot predicted by the coordinate-only model. 
+
+We [know](https://en.wikipedia.org/wiki/Effective_field_goal_percentage) that the __Effective Field Goal Percentage__ of a player can be calculated by using the formula below:
+
+$$
+\mbox{EFG} = \frac{2FG + 1.5 \times 3FG}{FGA},
+$$
+
+where $2FG$ is number of made shots from the two-point area, $3FG$ is number of made shots from the three-point area, and $FGA$ is the number of shots a player took.
+
+We will define a player's shot quality (__SQ__) as their __Predicted Effective Field Goal Percentage__. We can multiply the entries of the `make_prob` column by the $1.5$ for the three-point shots and average the new weighted `make_prob` column to get a player's __SQ__ score. 
+
+$$
+\mbox{SQ} = \frac{\sum_{i=1}^{FGA}w_i}{FGA},
+$$
+
+where $w_i$ is equal to the `make_prob` of shot $i$ for two-pointers and $w_i = 1.5 \times \mbox{make_prob}_i$ for three-pointers. In other words, $w_i$ is the weighted make probability of a specific shot or the _effective field goal percentage_ of a shot taken by the average player in the sample. Thus, __SQ__ if the effective field goal percentage that the __average player__ would get if they took the same shots. That said, if the player's __EFG__ is greater than their __SQ__, this implies that they shot better than predicted by the GAM model; that they shot better than the average player.
+
+Thus, we can define a player's shot making abilities (__SM__) as 
+
+$$
+\mbox{SM} = \mbox{EFG} - \mbox{SQ}
+$$
+
+since \mbox{EFG} = \mbox{SQ} + \mbox{SM}. We can think of __SM__ as a measure of how much better or worse the player shot compared to the average player taking the same shots. A positive __SM__ indicates that the player shot better than expected.
+
+```{r}
+sq_sm <- coord_df %>%
+  group_by(player) %>%
+  summarise(
+    position = unique(position),
+    shot_attempts = n(),
+    two_fg_made = sum(actual_points == 2),
+    two_fg_attempt = sum(shot_value == 2),
+    two_fg_pct = two_fg_made / two_fg_attempt,
+    three_fg_made = sum(actual_points == 3),
+    three_fg_attempt = sum(shot_value == 3),
+    three_fg_pct = three_fg_made / three_fg_attempt,
+    fg_pct = sum(shot_made_numeric) / shot_attempts,
+    efg_pct = (two_fg_made + 1.5 * three_fg_made) / shot_attempts * 100,
+    esq = mean(ifelse(shot_value == 2, make_prob, make_prob * 1.5)) * 100,
+    esm = efg_pct - esq,
+    efg = (two_fg_made + 1.5 * three_fg_made) / shot_attempts * 100,
+    # efg = sum(actual_points) / sum(shot_value) * 100,
+    sq = sum(x_points) / sum(shot_value) * 100,
+    sm = efg - sq
+  ) %>%
+  arrange(desc(sm))
+```
+
+```{r, eval=FALSE, echo=FALSE}
+test <- sq_sm %>%
+  select(
+    player, efg_pct, esq, esm, efg, sq, sm, shot_attempts, position
+  ) %>%
+  arrange(desc(esm))
+
+test %>%
+  filter(shot_attempts >= 50) %>%
+  ggplot(aes(x = esq, y = esm, color = position,size = shot_attempts)) +
+  #geom_point(aes()) +
+  geom_label_repel(aes(label = player)) +
+  geom_vline(xintercept = mean(test$esq), linetype = "dashed") +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  theme_classic() +
+  scale_size_continuous(guide = "none") +
+  labs(
+    title = "Shooting Ability Landscape",
+    x = "Shot Quality",
+    y = "Shot Making"
+  )
+
+df <- test %>%
+  filter(shot_attempts >= 50)
+
+plot_court() +
+  geom_point(data = shots_tb %>% filter(player == "Player 19"), 
+             aes(x = loc_x, y = loc_y, colour = shot_made_factor))
+
+plot_court() +
+  geom_point(data = shots_tb %>% filter(player == "Player 12"), 
+             aes(x = loc_x, y = loc_y, colour = shot_made_factor))
+
+plot_court() +
+  geom_point(data = shots_tb %>% filter(player == "Player 2"), 
+             aes(x = loc_x, y = loc_y, colour = shot_made_factor))
+```
+
+```{r sq-sm-tab, tidy=FALSE, echo = FALSE, eval = FALSE}
+knitr::kable(
+  sq_sm %>% select(player, position, shot_attempts, efg, sq, sm),
+  digits = 1,
+  caption = 'Voila! Who are the best shot makers?',
+  booktabs = TRUE
+)
+```
+
+```{r esq-esm-tab, tidy=FALSE, echo = FALSE}
+knitr::kable(
+  sq_sm %>% select(player, position, shot_attempts, efg, esq, esm),
+  digits = 1,
+  caption = 'Voila! Who are the best shot makers?',
+  booktabs = TRUE
+)
+```
+
+The __SM__ and __SQ__ values for each player are summarized in Table \@ref(tab:esq-esm-tab). By definition, adding the values of the __SM__ and __SQ__ columns result in the values of the __EFG__ column. The results of Table \@ref(tab:esq-esm-tab) are most likely easier to digest when visualized in Figure \@ref(fig:esq-esm-quad) below.
+
+```{r sq-sm-quad, fig.cap = 'What do the four quadrants mean?', out.width='100%', fig.align='center', eval = FALSE}
+sq_sm %>%
+  filter(shot_attempts >= 50) %>%
+  ggplot(aes(x = sq, y = sm, color = position,size = shot_attempts)) +
+  #geom_point(aes()) +
+  geom_label_repel(aes(label = player)) +
+  geom_vline(xintercept = mean(sq_sm$sq), linetype = "dashed") +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  theme_classic() +
+  scale_size_continuous(guide = "none") +
+  labs(
+    title = "Shooting Ability Landscape",
+    x = "Shot Quality",
+    y = "Shot Making",
+    caption = "***Only includes players with 50 shots or more."
+  )
+```
+
+```{r esq-esm-quad, fig.cap = 'What do the four quadrants mean?', out.width='100%', fig.align='center'}
+sq_sm %>%
+  filter(shot_attempts >= 50) %>%
+  ggplot(aes(x = esq, y = esm, color = position,size = shot_attempts)) +
+  #geom_point(aes()) +
+  geom_label_repel(aes(label = player)) +
+  geom_vline(xintercept = mean(sq_sm$esq), linetype = "dashed") +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  theme_classic() +
+  scale_size_continuous(guide = "none") +
+  labs(
+    title = "Shooting Ability Landscape",
+    x = "Shot Quality",
+    y = "Shot Making",
+    caption = "***Only includes players with 50 shots or more."
+  )
+```
+
+The __Shot Quality (SQ)__ is displayed on the $x$-axis. Low values for shot quality (left) indicates that the player is taking difficult shots^[shots with a low weighted make probabilities]. High values of shot quality (right) indicates that the player is taking easier shots in terms of location. The vertical dashed line represents the average shot quality.
+
+__Shot Making (SM)__ is displayed on the $y$-axis. Values above the horizontal dashed line indicate that the player is shooting better than expected. Low values of shot making indicate an underperformance relative to their expectation. The player labels are scaled by the number of shots attempted by the players.
+
+The players in the top-left quadrant of Figure \@ref(fig:esq-esm-quad) are taking the toughest shots in terms of location and still manage to make them way above expectation. The players in the bottom-right quadrant are shooting from regions that the average player would generate the most points per shot but struggle to shoot better than this average player.
+
+```{r quad-position, fig.cap = 'Comparing apples to apples (ish)', out.width='100%', fig.align='center'}
+p1 <- sq_sm %>%
+  filter(shot_attempts >= 50, position == "Post") %>%
+  ggplot(aes(x = esq, y = esm, size = shot_attempts)) +
+  #geom_point(aes()) +
+  geom_label_repel(aes(label = player)) +
+  geom_vline(xintercept = mean(sq_sm %>%
+                                 filter(position == "Post") %>%
+                                 pull(esq)),
+             linetype = "dashed") +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  theme_classic() +
+  scale_size_continuous(guide = "none") +
+  labs(
+    title = "Posts",
+    x = "Shot Quality",
+    y = "Shot Making",
+    caption = "***Only includes players with 50 shots or more."
+  )
+
+p2 <- sq_sm %>%
+  filter(shot_attempts >= 50, position == "Guard") %>%
+  ggplot(aes(x = esq, y = esm, size = shot_attempts)) +
+  #geom_point(aes()) +
+  geom_label_repel(aes(label = player)) +
+    geom_vline(xintercept = mean(sq_sm %>%
+                                 filter(position == "Guard") %>%
+                                 pull(esq)),
+             linetype = "dashed") +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  theme_classic() +
+  scale_size_continuous(guide = "none") +
+  labs(
+    title = "Guards",
+    x = "Shot Quality",
+    y = "Shot Making",
+    caption = "***Only includes players with 50 shots or more."
+  )
+
+grid.arrange(p1, p2, nrow = 1, ncol = 2)
+```
+
+Figure \@ref(fig:quad-position) separates Figure \@ref(fig:esq-esm-quad) into two plots according to the positions of the players. This can help better compare similar players competing for a similar role in the lineup.
+
+Of course, there are many other variable that influence whether a shot is difficult or not other than the $(x, ~y)$ coordinates of the shot. Defender distance is an obvious variable that is not included in our coordinate-only GAM model that would improve the validity of the results. That said, the goal of this chapter was to lay out the conceptual framework behind shooter evaluation that goes beyond simply comparing effective field goal percentages.
+
+__Note that all the ```R``` code used in this book is accessible on [GitHub](https://github.com/olivierchabot17/ballbook).__
+
+

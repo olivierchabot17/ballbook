@@ -1,0 +1,20 @@
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE)
+```
+
+# Acknowledgements {#acknowledgements}
+
+This book was initially put together for a geomatics directed-studies course I took with Dr. Murray Richardson as part of my master's in statistics at Carleton University. I reached out to Dr. Richardson to learn more about spatial statistics since my department did not offer a specialized course on the subject. He graciously accepted to supervise me for a semester. The chapters of the book served as my assignments which we established when we planned the course outline. You would not be reading this if I did not dedicate an entire course to spatial statistics with Dr. Richardson.
+
+My basketball analytics co-op is what sparked my interest in spatial statistics. Sports are inherently spatial and much is to be missed if this dimension of the game is left ignored. The alumni-funded research position consisted of working with the Carleton University Ravens women's team to conduct novel research to improve on-court performance. I owe all my basketball knowledge to the Ravens (and much of my analytics abilities). A special thank you to the coaches and players who answered my silly questions and who were receptive to my research from the beginning. The position was supervised by Dr. Shirley Mills who is well established in the sports analytics community. Thank you to everyone involved in making this dream co-op position a reality.
+
+I would also like to thank everyone who has graciously answered my niche questions when getting started. Todd W. Schneider's [BallR: Interactive NBA Shot Charts with R and Shiny](https://toddwschneider.com/posts/ballr-interactive-nba-shot-charts-with-r-and-shiny/) was immensely useful when trying to create basketball shot charts from scratch. It also thought me a ton about how to create an effective Shiny app. David Schoch also answered some of my beginner questions by email after I read their shot chart [article](http://blog.schochastics.net/post/mapping-nba-shot-locations/). I would like to thank the folks at [Easy Stats](https://www.easystatsapp.com/) for adding a FIBA basketball court based on my requests. I even met virtually with the main developer to discuss some of my research and feature requests. A big shout out to [Dr. Barry Rowlingson](http://barry.rowlingson.com/) for his [Data Camp Course](https://app.datacamp.com/learn/courses/spatial-statistics-in-r) on Spatial Statistics. Dr. Rowlingson was very generous and answered some of my questions in great detail. The GAM chapter could not have been written without his and Dr. Noam Ross' help. Dr. Ross' [free interactive GAM course](https://noamross.github.io/gams-in-r-course/) was exactly what I was looking for. I would also like to thank Dr. Adam Dennet for their freely accessible spatial statistics [tutorials](https://rpubs.com/adam_dennett). Many others helped in some form or another.
+
+Last but not least, I would like to thank my friends and family who pretended to care when I showed them a shot chart or talked about statistics. A special thank you to my partner who puts up with me when I'm obsessing over a problem. [Adam Shen](https://shena.ca/), a classmate of mine, was particularly helpful with the book. He helped me get started with [Bookdown](https://bookdown.org/). Adam came to the rescue many times when I was stuck on a piece of code or when I got a funky error in R. 
+
+Thank you to everyone else that wasn't mentioned. The book could not have been written without your help!
+
+Olivier
+
+
+

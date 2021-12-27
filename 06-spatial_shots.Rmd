@@ -1,0 +1,138 @@
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+# Basketball Shots as Spatial Objects {#spatial}
+
+__Note that all the ```R``` code used in this book is accessible on [GitHub](https://github.com/olivierchabot17/ballbook).__
+
+Let's load the basketball court and spatial polygons we've built in the previous chapters.
+
+```{r}
+# Load the plot_court() function from the previous chapters
+source("code/court_themes.R")
+source("code/fiba_court_points.R")
+# Load the different zone polygon objects
+source("code/zone_polygons.R")
+
+# Load libraries
+library(tidyverse) # ggplot and dplyr
+library(sf) # working with spatial objects
+```
+
+Next, we can load the augmented basketball shots data set we created in Chapter \@ref(shots-data).
+
+```{r}
+# Load shot data
+shots <- readRDS(file = "data/shots_augmented.rds")
+```
+
+```{r full-metrics, tidy=FALSE, echo = FALSE}
+knitr::kable(
+  head(shots) %>% select(-shot_made_numeric, -dist_meters, -theta_rad),
+  digits = 2,
+  caption = 'Display the first few shots of augmented data',
+  booktabs = TRUE
+)
+```
+
+Note that we have access to who took the shot, whether they made it or not, and from where on the court they released it. From there, we used the Pythagorean theorem to calculate the shot distance from the center of the hoop and we used trigonometric ratios to calculate the angle from the center line. 
+
+## The Spatial Advantage 
+
+We can convert our augmented shot data to an `sf` object to take advantage of the spatial nature of the data.
+
+```{r}
+# convert shots to an sf object
+shots_sf <- st_as_sf(shots, coords = c("loc_x", "loc_y"))
+
+# View sf object
+shots_sf %>% select(-shot_made_numeric, -dist_meters, -theta_rad)
+```
+
+The simple fact that our shots dataframe is now an `sf` object means that we can use the `st_join()` function which will automatically create zone columns based on the location of each shot relative to the polygons we created in Chapter \@ref(zones).
+
+```{r}
+# shot_zone_range
+shots_sf <- st_join(
+  x = shots_sf,
+  y = distance_polys
+) %>%
+  # shot_zone_area
+  st_join(
+    y = angle_polys
+  ) %>%
+  # shot_zone_basic
+  st_join(
+    y = basic_polys
+  ) %>%
+  # area_value
+  st_join(
+    y = point_polys
+  ) %>%
+  # shot_value
+  mutate(
+    shot_value = ifelse(area_value == "Two-Point Area", 2, 3)
+  ) %>%
+  # Reorder and only keep relevant variables
+  select(player, shot_made_numeric, shot_made_factor,
+         dist_feet, dist_meters, theta_deg, theta_rad, shot_value,
+         shot_zone_range, shot_zone_area, shot_zone_basic, area_value,
+         geometry)
+```
+
+The easiest way to test whether the join worked properly would be to randomly select a few shots and plot their different zone labels.
+
+```{r}
+set.seed(123) # Always Display the same random shots
+sample_shots_sf <- shots_sf %>% 
+  # Randomly select 20 shots
+  slice_sample(n = 20)
+```
+
+```{r, echo = FALSE, fig.cap = 'Check labels for the same20 random shots', out.width='100%', fig.align='center'}
+
+# To arrange plots in a 2x2 grid
+library(gridExtra)
+
+p1 <- plot_court() +
+  geom_sf_text(data = sample_shots_sf,
+               aes(color = shot_zone_range, label = shot_zone_range),
+               alpha = 0.8, show.legend = FALSE) +
+  labs(title = "Distance Based Zones")
+
+p2 <- plot_court() +
+  geom_sf_text(data = sample_shots_sf,
+               aes(color = shot_zone_area, label = shot_zone_area),
+               alpha = 0.8, show.legend = FALSE) +
+  labs(title = "Angle Based Zones")
+
+p3 <- plot_court() +
+  geom_sf_text(data = sample_shots_sf,
+               aes(color = shot_zone_basic, label = shot_zone_basic),
+               alpha = 0.8, show.legend = FALSE) +
+  labs(title = "Basic Zones")
+
+p4 <- plot_court() +
+  geom_sf_text(data = sample_shots_sf,
+               aes(color = factor(shot_value), label = shot_value),
+               alpha = 0.8, show.legend = FALSE) +
+  labs(title = "Point Value Zones")
+
+# plot 4 plots
+grid.arrange(p1, p2, p3, p4, ncol=2, nrow =2)
+```
+
+It seems like our joins worked properly. Let's save this new data set so we can easily load it in future chapters.
+
+```{r, eval = FALSE}
+# Save the spatial data
+saveRDS(shots_sf, file = "data/shots_sf.rds")
+```
+
+
+In the next chapter, we will create our first __shot chart__. How exciting! More specifically, we will try to determine whether the shot locations are spatially randomly distributed or if they seem to cluster.
+
+__Note that all the ```R``` code used in this book is accessible on [GitHub](https://github.com/olivierchabot17/ballbook).__
+
+

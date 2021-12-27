@@ -1,0 +1,111 @@
+---
+title: "Spatial Analysis of Basketball Shots in R"
+subtitle: Using the tidyverse, shiny, and the sf package
+author: "Olivier Chabot"
+site: bookdown::bookdown_site
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+# Overview {#intro}
+
+__Note that all the ```R``` code used in this book is accessible on [GitHub](https://github.com/olivierchabot17/ballbook).__
+
+The addition of the the three-point line has drastically changed the game of basketball. Kirk Goldsberry is one of the pioneers in visualizing the impact of this rule change. As displayed in his book [SprawlBall](https://amzn.to/3uwCVsv) or in this [article](https://fivethirtyeight.com/features/how-mapping-shots-in-the-nba-changed-it-forever/), the vast majority of shots in the NBA now come from behind the 3-point line and at the rim. This was not always the case. As a a result, the popularity of the mid-range shot has dropped dramatically in the last decade^[this [video](https://youtu.be/2p3NIR8LYoo) walks through the effect of the rule change]. Folks caught on to the idea that the extra point offered by a shot from above the break outweighs the slight decrease in field goal percentage of shooting from the mid-range. 
+
+## Setting our Expectations
+
+Consider a player who makes 35% of their shots from three and another player who makes 45% of their shots from the mid-range. We can simulate 1000 shots for each player using the `sample()` function. The summary of the 2000 shots are displayed in Table \@ref(tab:sim-shots).
+
+```{r}
+# Load libraries
+library(tidyverse) # wrangling
+
+# Sample Size
+n_shots <- 1000
+
+# Setting the seed to ensure reproducibility
+set.seed(2021)
+
+# Simulating n shots for both shooters
+shots = tibble(
+  three_shooter = sample(
+    x = c("Make", "Miss"), size = n_shots,
+    prob = c(0.35, 1 - 0.35), replace = TRUE
+    ),
+  two_shooter = sample(
+    x = c("Make", "Miss"), size = n_shots,
+    prob = c(0.45, 1 - 0.45), replace = TRUE
+    )
+)
+```
+
+```{r, echo = FALSE}
+# Tabulate outcomes
+shots_summary <- shots %>%
+  pivot_longer(cols = everything(),
+               values_to = "outcome", names_to = "shooter") %>%
+  table()
+
+# Rename the row names
+rownames(shots_summary) <- c("Three-Point Shooter", "Two-Point Shooter")
+```
+
+```{r sim-shots, tidy=FALSE, echo = FALSE}
+knitr::kable(
+  shots_summary,
+  caption = 'Results of 2000 randomly generated shots',
+  booktabs = TRUE
+)
+```
+
+Unsurprisingly, the three-point shooter made 343 out of 1000 shots which results in a shooting percentage of a shooting percentage of 34.3%. The mid-range shooter's shooting percentage was 45.3% in our simulated `r n_shots` shots. 
+
+On the surface, it seems like the mid-range shooter outperformed the three-point shooter^[$45\% > 34\%$]. However, when we consider that a made shot for the three-point shooter is worth three points instead of two, we see that they scored 1029 points^[$343 \times 3$] compared to 906 points^[$453 \times 2$] for the mid-range shooter. We can also divide the number of points each player scored by the number of shots they took to get their __average number of points per shot__. We get that the player shooting from three averaged $1029/`r n_shots` = 1.09$ points per shot compared to $(`r shots_summary[2, 1]` \times 2)/`r n_shots` = 0.91$ points per shots from the mid-range shooter. 
+
+We can see from this simplistic example that the two-point shooting percentage needs to be much greater than the three-point percentage to score more points per attempt on average. In fact, we know that the shooting percentage of a two-point shooter needs to be __1.5 times greater__ than the shooting percentage of a player shooting beyond the arc for the expected points per shot to be equal. For example, shooting 45% from two would result in $0.45 \times 2 = 0.9$ points per shot which is the same as shooting 30% from three^[$0.3 \times 3 = 0.9$]. 
+
+We know from studying [millions of NBA shots](https://toddwschneider.com/posts/nba-vs-ncaa-basketball-shooting-performance/) that the shooting percentage is highest around the rim (roughly 60%). That percentage drops sharply to approximately 40% for the remainder of the two-point area and drops slightly to 35% beyond the arc. That said, shots at the rim do exceed the __1.5 times threshold__ established earlier but shooting from anywhere else in the two-point area does not meet this criteria.
+
+The insight that __three is greater than two__ may seem obvious in hindsight or from the outside perspective but it wasn't until the location of each shot was recorded and analyzed that the light bulb went off. A team could look at their shooting percentage from the two-point area (say roughly 50%) and their three-point shooting percentage (say 30%) and conclude that they should shoot more threes since $0.5 \times 2 = 1$ expected point per shot is greater than $0.3 \times 3 = 0.9$. This approach fails to consider that not all two-point attempts are created equal. The same can be said about three-point shots but the contrast is sharper for two-point shots.
+
+## Motivation
+
+Despite the new popularity threes, lower level teams do not have an easy way to analyze their shooting performance by other means than the field goal percentage or [effective field goal percentage](https://www.basketball-reference.com/about/glossary.html) typically found in the box score. Some coaches track shot locations using pen and paper to manually create shot charts for the team and each player. This approach has obvious limitations. The measurement error has to be significant. After all, the person tracking the shots is simply eyeballing the release location and approximating it again to place the dot on the page. This method also makes it practically impossible to look at long term trends since the data is not stored in a database where the charts could be reproduced. Drawing conclusions from a team's shot chart of a particular game is dangerous since the number of shot attempts is not big enough to reveal the "true" underlying patterns. This is even more true when trying to evaluate a player's performance by looking at their game shot chart.
+
+Many Android or iOS applications allow teams to track box score statistics. However, not many applications allow teams to track shot locations. Even fewer allow the user to export the $(x, ~y)$ coordinates of each shots in a usable format such as a csv file. [Easy Stats](https://www.easystatsapp.com/) is one of the rare applications that does. It automatically creates shot charts and allows the user to easily export the coordinates.
+
+This books will walk you through how to create Goldsberry-like shot charts and analyze the spatial structure of basketball shots using [`R`](https://www.r-project.org/about.html), the popular [`tidyverse`](https://www.tidyverse.org/) package, and the [`sf`](https://r-spatial.github.io/sf/) package.
+
+## Why [`R`](https://www.r-project.org/about.html)?
+
+__Reproducibility__ is the main advantage of using `R` over a standard spatial analysis software such as [ArcGIS](https://www.arcgis.com/index.html). `R` uses scripts which means that analyses can be shared and reproduced easily. The programming language was built for and by statisticians who decided to keep it __open source__. As a result, many packages have emerged to extend its functionality to specific niches. The [RStudio](https://www.rstudio.com/) IDE^[Integrated Development Environment] makes `R` more approachable. This book was produced using [R Mardown](https://rmarkdown.rstudio.com/) and [Bookdown](https://bookdown.org/) which are integrated within RStudio.
+
+## Why the [`tidyverse`](https://www.tidyverse.org/) package?
+
+> "The `tidyverse` is an opinionated collection of R packages designed for data science. All packages share an underlying design philosophy, grammar, and data structures." - [Tidyverse Developpers](https://www.tidyverse.org/)
+
+Two key characteristics of the `tidyverse` are [tidy data](https://r4ds.had.co.nz/tidy-data.html) and [piping](https://style.tidyverse.org/pipes.html).
+
+There are three interrelated rules which make a dataset tidy:
+
+1. Each variable must have its own column.
+2. Each observation must have its own row.
+3. Each value must have its own cell.
+
+The analysis in this book makes use of tidy data and piping. Furthermore, it attempts to follow this coding [style guide](http://adv-r.had.co.nz/Style.html) as much as possible.
+
+## Why the [`sf`](https://r-spatial.github.io/sf/) package?
+
+The [simple features](https://r-spatial.github.io/sf/) (`sf`) package was built to modernize the widely used [`sp`](https://cran.r-project.org/web/packages/sp/vignettes/intro_sp.pdf) package. Part of this modernization was to treat spatial objects as data frames so it would be compatible with the tidyverse.
+
+It is definitely possible to create advanced shot charts using base `R` or with the `tidyverse`. In fact, this book was heavily influenced by Todd W. Schneider's [BallR Shiny app](https://github.com/toddwschneider/ballr). The reason that we will use the `sf` package is that it makes it easier to work with spatial data. 
+
+> We won't have to continually reinvent the wheel.
+
+Spatial data often requires special treatment. Observations may not be independent of their neighbours. In fact, [Tobler's First Law of Geography](https://en.wikipedia.org/wiki/Tobler%27s_first_law_of_geography) states that "everything is related to everything else, but near things are more related than distant things." Creating maps and polygons using non-spatial tools such as the tidyverse can be laborious and computationally inefficient. Using [tools](https://github.com/rstudio/cheatsheets/blob/master/sf.pdf) from the `sf` package makes it much more efficient to create and analyze spatial data. Moreover, an argument can be made that nearly all data are spatio-temporal in nature since they are collected _somewhere_ at some _time_. At the time of this writing, spatial data have never been more abundant. Yet, the online tutorial community has not yet caught up to the tsunami of coordinate data.
+
+
+__Note that all the ```R``` code used in this book is accessible on [GitHub](https://github.com/olivierchabot17/ballbook).__

@@ -1,0 +1,204 @@
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+# Nearest Neighbour Analysis {#neighbour}
+
+__Note that all the ```R``` code used in this book is accessible on [GitHub](https://github.com/olivierchabot17/ballbook).__
+
+The quadrat analysis of Chapter \@ref(quadrat)  did not consider the arrangement of points in relation to one another. We can calculate the distance between each shot and its nearest neighbour to counteract theses limitations.
+
+```{r, echo = FALSE}
+# Load libraries
+library(spatstat)
+library(tidyverse)
+library(sf)
+
+# Load the plot_court() function from the previous chapters
+source("code/court_themes.R")
+source("code/fiba_court_points.R")
+# Load the different zone polygon objects
+source("code/zone_polygons.R")
+
+# Load shot spatial data
+shots_sf <- readRDS(file = "data/shots_sf.rds")
+
+# Define a point sfg object for the center of the hoop
+hoop_center <- st_point(c(width/2, hoop_center_y))
+
+# Create a circle with radius 9 and crop it to fit within the court
+window_points <- st_crop(
+  st_sfc(st_buffer(hoop_center, dist = 7.75)),
+  xmin = 0, ymin = backboard_offset - backboard_thick,
+  xmax = width, ymax = height
+)
+
+# Create a polygon sf object with the coordinates
+window_points <- st_polygon(list(
+  st_coordinates(window_points)[ , 1:2]
+  ))
+
+# Define a window based on where the shots tend to take place
+window <- as.owin(window_points)
+
+# only keep the shots that are in the window
+shots_window <- shots_sf[window_points, ]
+
+# Create a ppp object
+shots_ppp <- ppp(
+  x = st_coordinates(shots_window)[, 1],
+  y = st_coordinates(shots_window)[, 2],
+  shot_made_numric = shots_window$shot_made_numeric,
+  window = window)
+
+n_shots <- nrow(shots_window)
+window_area <- st_area(window_points)
+```
+
+
+We can use the `nndist()` function from the [`spatstat`](https://spatstat.org/) package to easily calculate the distances.
+
+```{r}
+# Calculate Nearest Neighbour distances
+nn_distances <- nndist(shots_ppp)
+```
+
+```{r nn-hist, echo = FALSE, fig.cap = 'The shots are not scared of their neighbours!', out.width='100%', fig.align='center'}
+# Plot a histogram of the distances
+hist(nn_distances,
+     main = "Nearest Neighbour Distance Distribution",
+     xlab = "Distance (meters)") 
+```
+
+Figure \@ref(fig:nn-hist) tells us that the distribution of nearest neighbour distances is highly __skewed to the right__. This implies that the majority of the shots have a __neighbour nearby__. In fact, $\frac{`r hist(nn_distances)$counts[1]` + `r hist(nn_distances)$counts[2]`}{`r nrow(shots_window)`} = `r round(((hist(nn_distances)$counts[1] + hist(nn_distances)$counts[2]) / nrow(shots_window))*100, digits = 2)`$% of the shots have a nearest neighbour that is located within 20 centimeters. The furthest nearest neighbour in our sample is `r round(max(nn_distances)*100, digits = 2)` centimeters away.
+
+```{r nn-shots, echo = FALSE, fig.cap = 'The mid-range loners', out.width='100%', fig.align='center'}
+ppp_as_sf <- st_as_sf(shots_ppp) %>%
+  filter(label == "point") %>%
+  mutate(
+    nn_dist = nn_distances,
+    close_neighbour = case_when(
+      nn_dist <= 0.20 ~ TRUE,
+      nn_dist > 0.20 ~ FALSE
+    )
+  )
+
+plot_court() +
+  geom_sf(data = st_buffer(ppp_as_sf, dist = ppp_as_sf$nn_dist), 
+          aes(colour = close_neighbour), alpha = 0) +
+  geom_sf(data = ppp_as_sf, 
+          aes(colour = close_neighbour),size = 0.5) +
+  geom_label(aes(x = width/2, y = height - 2.5,
+                label = "Neighbour Within 20 cm?")) +
+  geom_label(aes(x = width/2 -2, y = height - 3.5,
+                label = "FALSE"), fill = "red") +
+  geom_label(aes(x = width/2 + 2, y = height - 3.5,
+                label = "TRUE"), fill = "green") +
+  # Red = FALSE, Green = TRUE
+  scale_color_manual(values = c("red", "green")) +
+  labs(title = "Visualizing the Nearest Neighbours") +
+  theme(
+    plot.title = element_text(hjust = 0.5),
+    legend.position = "none"
+  )
+```
+
+Figure \@ref(fig:nn-shots) is an attempt to plot the nearest neighbour distances. Most of the lonely shots^[shots that don't have a neighbour within a 20 centimeter radius] reside in the mid-range or on the outskirts of the three-point line.
+
+## G Function {#G-function}
+
+We can calculate the overall probability  of having a nearest neighbour within a specific distance using the `Gest()` function from the `spatstat` package.
+
+```{r}
+# Calculate the Cumulative Nearest Neighbour Distribution for all distances
+G <- Gest(shots_ppp, correction = "border")
+```
+
+```{r G, echo = FALSE, fig.cap = 'Higher probability than expected for short distances', out.width='100%', fig.align='center'}
+data.frame(G) %>%
+  rename(Theoretical = theo, Empirical = rs) %>%
+  pivot_longer(cols = !r, names_to = "type", values_to = "prob") %>%
+  ggplot(aes(x = r, y = prob, colour = type)) +
+  geom_line(size = 1.5) +
+  geom_hline(yintercept = 1, linetype = "dashed", alpha = 0.4) +
+  scale_x_continuous(breaks = seq(from = 0 , to = 1, by = 0.1)) +
+  theme_classic() +
+  labs(
+    title = "Cumulative Nearest Neighbour Distribution",
+    x = "Distance (meters)",
+    y = "Probability"
+  ) +
+  theme(
+    legend.title = element_blank(),
+    legend.position = c(.95, .25),
+    legend.justification = c("right", "bottom"),
+    legend.box.just = "right",
+    legend.margin = margin(6, 6, 6, 6)
+    )
+```
+
+The theoretical cumulative distribution of nearest neighbours^[blue curve] is given by $P(D < r) = 1 - e^{-\lambda\pi r^2}$, where $\lambda$ is the intensity of our point pattern of  $\frac{`r n_shots` ~ \mbox{shots}}{`r round(window_area, digits = 2)` ~ m^2} \approx `r round (n_shots / window_area, digits = 1)` \frac{\mbox{shots}}{m^2}$. The fact that the empirical G^[red curve] increases more rapidly at short distances is __evidence for clustering__. It also makes sense that the empirical probability of having a nearest neighbour within 0.5 meters is close to one given the skewness of the distribution and the max nearest neighbour distance being `r round(max(nn_distances)*100, digits = 2)` centimeters.
+
+We could simulate envelopes around the theoretical curve to test whether the empirical curve significantly differs. However, we will stick with the __the interocular traumatic test__^[see Section \@ref(iott) for more details] for now given our results from the quadrat test and our general knowledge that basketball shots depart from complete spatial randomness (CSR). It is pretty clear that red curve is far from the blue curve. 
+
+
+## Ripley's K Function {#K-function}
+
+The official name of the K function is _Ripley's reduced second moment function_. $K(r)$ is calculated by calculating the average number of neighbouring points within a radius of $r$ meters of each shot. The `Kest()` function from the [`spatstat`](https://spatstat.org/) package allows us to repeat this process for all relevant values of $r$.
+
+Note that $\lambda \cdot K(r)$ is the average number of basketball shots to be found within a given distance $r$ from a random shot^[recall that $\lambda$ is the intensity of our sample of basketball shots (roughly $`r round (n_shots / window_area, digits = 1)` \frac{\mbox{shots}}{m^2}$)]. Additionally, we kow that  $K(r) = \pi r^2$ for a completely random [Poisson point process](https://en.wikipedia.org/wiki/Poisson_point_process)^[the area of the circular neighbourhood around each point].
+
+```{r}
+K <- Kest(shots_ppp, correction = "border")
+```
+
+```{r, echo = FALSE}
+k_1 <- data.frame(K) %>%
+  filter(r >= 1) %>%
+  head(n = 1)
+
+lk_1_observed <- as.numeric((n_shots / window_area) * k_1[3])
+
+lk_1_true <- (n_shots / window_area) * pi
+```
+
+Let's consider $K(1)$ as an example. We can calculate it by counting the number of neighbours within a radius of 1 meter of each shot and then taking the average. It turns out that $K(1) = `r round(k_1[3], digits = 3)` ~ m^2$ for our sample. Thus, the average observed number of points within a 1 meter radius of a random point was $`r round (n_shots / window_area, digits = 1)` \frac{\mbox{shots}}{m^2} \cdot `r round(k_1[3], digits = 3)` ~ m^2 \approx `r round(lk_1_observed)`$ shots. If the shots were random, then we would expect $`r round (n_shots / window_area, digits = 1)` \frac{\mbox{shots}}{m^2} \cdot \pi ~ m^2 \approx `r round(lk_1_true)`$ shots within a one meter radius of a random point. These numbers are represented by the dashed line in Figure \@ref(fig:K) below.
+
+```{r K, echo = FALSE, fig.cap = 'More shots than expected for any given distance', out.width='100%', fig.align='center'}
+data.frame(K) %>%
+  rename(Theoretical = theo, Empirical = border) %>%
+  pivot_longer(cols = !r, names_to = "type", values_to = "k") %>%
+  mutate(lambda_k = (n_shots / window_area) * k) %>%
+  ggplot(aes(x = r, y = lambda_k, colour = type)) +
+  geom_line(size = 1.5) +
+  geom_segment(x = 1, y = 0, xend = 1, yend = lk_1_observed,
+               linetype = "dashed", alpha = 0.2) +
+  geom_segment(x = 0, y = lk_1_observed, xend = 1, yend = lk_1_observed,
+               linetype = "dashed", alpha = 0.2) +
+  geom_segment(x = 0, y = lk_1_true, xend = 1, yend = lk_1_true,
+               linetype = "dashed", alpha = 0.2) +
+  scale_y_continuous(breaks = seq(from = 0, to = 200, by = 25)) +
+  theme_classic() +
+  labs(
+    title = "Average Number of Shots Within Specified Radius",
+    x = "Radius (meters)",
+    y = expression(paste("Expected Points (", lambda*K, ")", sep =""))
+  ) +
+  theme(
+    legend.title = element_blank(),
+    legend.position = c(.95, .25),
+    legend.justification = c("right", "bottom"),
+    legend.box.just = "right",
+    legend.margin = margin(6, 6, 6, 6)
+    )
+```
+
+If the red line is above the blue line, then that means that there were more shots than expected^[under the null hypothesis that shots are CSR] for that specific distance. In our case, the observed $K$ is greater than the theoretical one for any given radius. Subsequently, we conclude that our shot locations are __clustered__. If the red line was below the blue line, then this would be evidence that the shot locations are dispersed. Again, Monte-Carlo simulation could be used to calculate a p-value, but just looking at the curves is good enough for now.
+
+## Limitation
+
+A big limitation of this type of analysis is that we know the shots appear to be clustered, but we don't know where those clusters are. Even the untrained eye can look at a shot chart (Figure \@ref(fig:scatterplot)) and intuitively draw circles around the denser areas. The next chapter will explore how we can visualize and quantify the clusters.
+
+__Note that all the ```R``` code used in this book is accessible on [GitHub](https://github.com/olivierchabot17/ballbook).__
+
+

@@ -1,0 +1,263 @@
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+# Point Pattern Analysis {#quadrat}
+
+__Note that all the ```R``` code used in this book is accessible on [GitHub](https://github.com/olivierchabot17/ballbook).__
+
+Now that we've built spatial objects for the basketball shots and basketball court, we can finally start investigating the spatial structure of the data. __Point pattern analysis__ is the typical name for this sort of investigation. The focus of this chapter is to explore the __spatial distribution of the shot locations__.
+
+Let's load the spatial shots, the basketball court, and the spatial polygons we've built in the previous chapters. Additionally, we can load the [`spatstat`](https://spatstat.org/) package for its point pattern analysis functions.
+
+```{r}
+# Load libraries
+library(spatstat)
+library(tidyverse)
+library(sf)
+
+# Load the plot_court() function from the previous chapters
+source("code/court_themes.R")
+source("code/fiba_court_points.R")
+# Load the different zone polygon objects
+source("code/zone_polygons.R")
+
+# Load shot spatial data
+shots_sf <- readRDS(file = "data/shots_sf.rds")
+```
+
+The analysis below was heavily influenced by Adam Dennett's publicly accessible [tutorials](https://rpubs.com/adam_dennett). Let's plot our data so we have an idea of what we are working with.
+
+```{r scatterplot, echo = TRUE, fig.cap = 'The eye-test seems to indicate the presence of clustering', out.width='100%', fig.align='center'}
+plot_court() +
+  geom_sf(data = shots_sf, aes(color = shot_made_factor),
+          alpha = 0.1, size = 1) +
+  # Red = Miss, Green = Make
+  scale_color_manual(values = c("red", "green")) +
+  # Remove legend title
+  theme(legend.title = element_blank())
+```
+
+## Quadrat Analysis
+
+The question we want to answer is: 
+
+> Are the shots distributed randomly^[[Poisson point process](https://en.wikipedia.org/wiki/Poisson_point_process)] or do they exhibit some kind of dispersed or clustered pattern?
+
+Another way of saying this is:
+
+> Does the distribution of shot locations differ from __complete spatial randomness (CSR)__^[sometimes referred to as homogeneous spatial Poisson process]?
+
+### Hypotheses
+
+We can formalize this by proposing the following hypotheses:
+
+$$
+\begin{aligned}
+ H_0 &: ~~\mbox{shot locations are completely spatially random} \\
+ H_A &: ~~\mbox{shot locations are NOT completely spatially random}
+\end{aligned}
+$$
+
+The easiest way to test this hypothesis is to conduct a __quadrat test__. To do this, we need to split up the court into a grid and count the number of shots that fall within each cell of the grid. We will use the `quadratcount()` function from the `spatstat` package to achieve this. 
+
+### Observation Window
+
+But first, we need to create an observation window to inform the package which region of the court we are interested in. We could use the entire half-court (or the full-court for that matter), but the vast majority of the shots were taken between the backboard and a few feet past the three-point line. Therefore, we will create a window that is essentially a circle centered at the hoop with a radius of 7.75 meters. The circle is cropped to fit within the court and to be above the backboard. 
+
+```{r}
+# Define a point sfg object for the center of the hoop
+hoop_center <- st_point(c(width/2, hoop_center_y))
+
+# Create a circle with radius 9 and crop it to fit within the court
+window_points <- st_crop(
+  st_sfc(st_buffer(hoop_center, dist = 7.75)),
+  xmin = 0, ymin = backboard_offset - backboard_thick,
+  xmax = width, ymax = height
+)
+
+# Create a polygon sf object with the coordinates
+window_points <- st_polygon(list(
+  st_coordinates(window_points)[ , 1:2]
+  ))
+
+# Define a window based on where the shots tend to take place
+window <- as.owin(window_points)
+```
+
+```{r, echo = FALSE, fig.cap = 'Observation window for our quadrat analysis', out.width='100%', fig.align='center'}
+plot_court() +
+  # Plot window
+  geom_sf(data = window_points, fill = "grey", alpha = 0.5) +
+  # Plot shots
+  geom_sf(data = shots_sf, aes(color = shot_made_factor),
+          alpha = 0.1, size = 1) +
+  # Red = Miss, Green = Make
+  scale_color_manual(values = c("red", "green")) +
+  # Remove legend title
+  theme(legend.title = element_blank())
+```
+
+```{r, echo = FALSE}
+# # Create a convex hull for the shots
+# convex_shots <- st_convex_hull(st_geometry(st_union(shots_sf)))
+# 
+# # Define a window based on where the shoots took place
+# window <- as.owin(st_convex_hull(st_geometry(st_union(shots_sf))))
+```
+
+```{r, echo = FALSE}
+# plot_court() +
+#   # Plot window
+#   geom_sf(data = convex_shots, fill = "grey", alpha = 0.5) +
+#   # Plot shots
+#   geom_sf(data = shots_sf, aes(color = shot_made_factor),
+#           alpha = 0.1, size = 1) +
+#   # Red = Miss, Green = Make
+#   scale_color_manual(values = c("red", "green")) +
+#   # Remove legend title
+#   theme(legend.title = element_blank())
+```
+
+The __vast majority__ of basketball shots were released within this area. This is where the action takes place.
+
+The `spatstat` package unfortunately does not yet work with `sf` objects. As a result, we will need to create a __planar point pattern (ppp)__  object for the shots that fall within our observational window.
+
+```{r}
+# only keep the shots that are in the window
+shots_window <- shots_sf[window_points, ]
+
+# Create a ppp object
+shots_ppp <- ppp(
+  x = st_coordinates(shots_window)[, 1],
+  y = st_coordinates(shots_window)[, 2],
+  window = window)
+```
+
+### Quadrat Test {#iott}
+
+```{r, echo=FALSE, eval=FALSE}
+# grid <- st_make_grid(shots_sf)
+# 
+# plot_court() +
+#   geom_sf(shots_sf) +
+#   geom_sf(grid)
+```
+
+Now we can use the `quadratcount()` function from the `spatstat` package and plot the results. 
+
+```{r quadrat-count, echo = FALSE, fig.cap = 'Are the cell counts random?', out.width='100%', fig.align='center'}
+# Plot the points
+plot(shots_ppp, pch = 16, cex = 0.5,
+     main = "Quadrat Test Cell Count - Default")
+# Add the grid and counts
+plot(quadratcount(shots_ppp), add = TRUE, col = "red")
+```
+
+If the shots were spatially random, then we can imagine that the observed number of points within each cell would be similar for all equally sized cells. This is definitely NOT the case in Figure \@ref(fig:quadrat-count).
+
+```{r}
+# Conduct Quadrat Test
+qtest <- quadrat.test(shots_ppp)
+
+# Display Results
+qtest
+```
+
+We see that the p-value for the __quadrat test__^[Chi-squared test] is very close to zero. This implies that the probability of observing the shot locations in our sample is extremely unlikely if the null hypothesis was true^[i.e. that the shots were completely spatially random]. In fact, we didn't need to calculate a p-value to reach this conclusion. We could have used a much simpler method; __the interocular traumatic test__^[mentioned in this [article](https://www.r-bloggers.com/2016/11/inter-ocular-trauma-test/)]. This test can be used when the result is so obvious that it hits you between the eyes, hence causing "inter-ocular trauma". The cell that encloses the hoop contains 354 shots. This is an order of magnitude (10X) more than most cells.
+
+### Chi-squared Statistic
+
+```{r, echo = FALSE}
+n_shots <- nrow(shots_window)
+areas <- data.frame(quadratcount(shots_ppp))
+
+cell_base <- 3
+cell_height <- 1.65
+cell_area <- cell_base*cell_height
+window_area <- st_area(window_points)
+
+exp_shots_per_cell <- n_shots * (cell_area/window_area)
+```
+
+The Chi-squared statistic for the quadrat test is defined as follows:
+
+$$
+\chi^2 = \sum_{i=1}^{25} \frac{(O_i - E_i)^2}{E_i},
+$$
+where $O_i$ is the observed number of shots in each cell and $E_i$ is the expected number of shots in each cell. The red numbers in Figure \@ref(fig:quadrat-count) represent the observed cell counts ($O_i$). We can try to calculate how many shots we should expect in each cell if they had a complete spatial random distribution ($E_i$). We have `r n_shots` shots in our window. The area of the cells that are equal in size is roughly $`r cell_area` ~m^2$ ($`r cell_base` \times `r cell_height`$) while the entire area of the window is $`r round(window_area, digits  = 2)`~m^2$ . Then, each of those equally sized cells should contain roughly $`r n_shots` \times \frac{`r cell_area`~m^2}{`r round(window_area, digits = 1)`~m^2} \approx `r round(exp_shots_per_cell)`$ shots. 
+
+The areas for the rectangular cells are easy to calculate. However, we will use the `quadrat.test()` function to calculate the area of the irregularly-shaped cells for us. 
+
+```{r quadrat-exp, echo = FALSE, fig.cap = 'Expected shots per cell (top-right corner)', out.width='100%', fig.align='center'}
+# Plot the points
+plot(shots_ppp, pch = 16, cex = 0.5,
+     main = "Quadrat Test Cell Count - Default")
+# Add the grid and counts
+plot(qtest, add = TRUE, col = "red")
+```  
+
+In the Figure \@ref(fig:quadrat-exp), we can see three figures for each quadrat. The __top-left number__ is the observed count of shots ($O_i$). The __top-right number__ is the Poisson expected number of shots ($E_i$). Lastly, the __bottom number__ is the Pearson residual value defined as $\frac{O_i - E_i}{\sqrt{E_i}}$. There are three things worth pointing out about the picture above. Notice how all the rectangular cells have 55.9 in the top-right corner. This confirms the expected number of shots we calculated by-hand in the previous paragraph. Furthermore, the expected number of shots in each cell^[top-right number] is proportional to the area of the cell. Lastly, the Chi-squared statistic $\chi^2 = \sum_{i=1}^{25} \frac{(O_i - E_i)^2}{E_i}$ is the sum of the squared Pearson residuals^[bottom red numbers]. Thus, a larger Chi-squared value is evidence that the observed cell counts were far from the expected cell counts based on a random spatial distribution.
+
+### Generating Artificial Shots
+
+We can use the `st_sample()` function from the `sf` package to randomly generate shot locations. 
+
+```{r}
+set.seed(2021)
+csr_points_sf <- st_sample(
+  x = window_points,
+  size = nrow(shots_window),
+  type = "random",
+  exact = TRUE
+)
+```
+
+```{r, echo = FALSE, fig.cap = 'Randomly generated CSR points', out.width='100%', fig.align='center'}
+plot_court() +
+  # Plot window
+  geom_sf(data = window_points, fill = "grey", alpha = 0.5) +
+  # Plot shots
+  geom_sf(data = csr_points_sf,
+          alpha = 0.6, size = 1) +
+  labs(title = "Random Artificial Shot Locations")
+```
+The shot locations from the plot above look much more evenly distributed than the shot locations from our sample.
+
+```{r, echo = FALSE}
+csr_points_ppp <- ppp(
+  x = st_coordinates(csr_points_sf)[, 1],
+  y = st_coordinates(csr_points_sf)[, 2],
+  window = window)
+# Conduct Quadrat Test
+qtest_csr <- quadrat.test(csr_points_ppp)
+
+# Display Results
+qtest_csr
+```
+
+The p-value of the quadrat test for the artificial shots is greater than 0.05 so we can't conclude that the shot locations are not completely spatially random.
+
+```{r, echo = FALSE, fig.cap = 'Randomly generated CSR points', out.width='100%', fig.align='center'}
+# Plot the points
+plot(csr_points_ppp, pch = 16, cex = 0.5,
+     main = "Quadrat Test Cell Count - CSR")
+# Add the grid and counts
+plot(qtest_csr, add = TRUE, col = "red")
+```
+
+It is not surprising that the number of observed artificial shot locations^[top-left red number] within each cell is close to the expected number based on the Poisson distribution^[top-right red number].
+
+## Further Investigation
+
+It is pretty obvious that the shots in our sample are not random. There are some visible clusters. However, it is much less obvious when trying to answer the same question within a specific zone instead of the half-court. Quadrat analysis could be used to test whether mid-range shots follow CSR^[see Chapter \@ref(zones) to get familiar with the standard zones] for example.
+
+## Limitations
+
+Quadrat analysis has serious limitations. First, the size of the grid cells affects the power of the quadrat test. If the cells are too large, then there won't be enough cell counts to compare to the poisson distribution. If the cells are too small, then we run the risk of not having enough shots within each cell. Second, the quadrat approach does not take into account the arrangement of points in relation to one another. Instead, it only considers the density of the points. Third, it results in a single measure for the entire distribution and variations within the each cell won't be considered.
+
+The next chapter will try to address some of these limitations.
+
+__Note that all the ```R``` code used in this book is accessible on [GitHub](https://github.com/olivierchabot17/ballbook).__
+
+

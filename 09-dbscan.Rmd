@@ -1,0 +1,240 @@
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE)
+```
+
+# Spatial Clustering {#clusters}
+
+__Note that all the ```R``` code used in this book is accessible on [GitHub](https://github.com/olivierchabot17/ballbook).__
+
+Let's try to build on the findings from the previous chapters. We know that the shots appear to be clustered instead of being completely spatially random (CSR). A natural extension of this result is to investigate where such clusters may reside.
+
+## DBSCAN {#dbscan}
+
+We will use the DBSCAN^[Density-Based Spatial Clustering of Applications with Noise (learn more about this technique [here](https://en.wikipedia.org/wiki/DBSCAN))] algorithm to try to classify the shots into groups based on the number of points nearby^[see Chapter \@ref(neighbour) for the full neighbour investigation]. This [video](https://youtu.be/_A9Tq6mGtLI) shows a quick walk-through of how this technique works. I have also particularly enjoyed this [article](https://towardsdatascience.com/a-gentle-introduction-to-hdbscan-and-density-based-clustering-5fd79329c1e8). The algorithm can be described at a high-level with the following steps:
+
+0. Specify the two parameters of the algorithm.
+   + $\varepsilon$ is the radius of the epsilon neighborhood^[circular region of radius $\varepsilon$, centered at the starting point].
+   + `minPTS` is the minimum number of __core points__ (including starting point) required in the epsilon neighborhood for a cluster to be formed.
+1. Randomly select a shot location (__starting point__).
+2. Identify the shots (__core points__) in the $\varepsilon$-neighbourhood of the __starting point__.
+3. A cluster is formed if there are at least $n=$`minPTS` __core points__ in the $\varepsilon$-neighborhood of the __starting point__.
+4. Once a cluster is formed, each core point will broadcast their own $\varepsilon$-neighbourhoods with the hope of adding new points to the cluster.
+5. Once a cluster is complete, the algorithm repeats these steps starting at __step 1__ with a random point that is __not__ already part of a cluster. If all unclustered points can't be added to a cluster, then these points are labeled as __noise__^[labeled cluster 0] and the process is __done__.
+
+Playing around with this [interactive visualization](https://www.naftaliharris.com/blog/visualizing-dbscan-clustering/) is a great way to build up some intuition about how the DBSCAN algorithm works.
+
+### Advantages of DBSCAN
+
+The reasoning behind using DBSCAN over other clustering algorithms is fourfold. __First__, we don't need to specify the number of clusters in advance. This is crucial since although we might have a rough idea of where the shots are coming from, the purpose of using a clustering algorithm is to pick up patterns that may not be obvious by looking at a shot chart or a heatmap^[see Chapter \@ref(density) to learn more about heatmaps]. __Second__, the two parameters of the algorithm (`minPTS` and $\varepsilon$) are intuitive enough to be carefully chosen by a domain expert^[Read the parameter selection section below to see what we mean by domain expert.]. __Third__, DBSCAN can identify arbitrarily-shaped clusters. It is unlikely that the clusters around the rim and the clusters around the three-point line have the same shape. __Fourth__, this technique is robust to outliers and noise. This is necessary to adequately analyze basketball shots. A buzzer-beater half-court shot should not be considered in the same way as a lay up. For the reasons listed above, the DBSCAN clustering algorithm seems to be a proper tool for our analysis.
+
+### Parameter Selection
+
+```{r}
+# Load libraries
+library(spatstat)
+library(tidyverse)
+library(sf)
+
+# Load the plot_court() function from the previous chapters
+source("code/court_themes.R")
+source("code/fiba_court_points.R")
+# Load the different zone polygon objects
+source("code/zone_polygons.R")
+
+# Load shot spatial data
+shots_sf <- readRDS(file = "data/shots_sf.rds")
+
+# 0.2
+#1.4785536283*(n_shots / window_area)
+
+# 0.3 meters
+#2.4926554736*(n_shots / window_area)
+```
+
+We can use the results from Chapter \@ref(neighbour) to inform our parameter selection. Section \@ref(G-function) told us that 90% of the shots have a nearest neighbour that is located within 20 centimeters. Furthermore, Ripley's K Function from Section \@ref(K-function) gave us the average number of points within a certain radius of a random shot. Given the relatively large number of shots in our dataset^[`r nrow(shots_sf)` to be exact] and the fact that the K function told us that there was an average of roughly 16 shots within a radius of 20 centimeters, it is reasonable to naively adopt these two values as good starting points for $\varepsilon$ and `minPTS`. Larger values for `minPTS` will result in smaller more significant clusters. The same can be said about smaller values for $\varepsilon$.
+
+### Naive Results
+
+```{r}
+# Define the two parameters based on naive values
+epsilon <- 0.2
+min_points <- 16
+```
+
+The analysis below was inspired by Adam Dennett's publicly accessible [tutorials](https://rpubs.com/adam_dennett). Let's plot the results of the DBSCAN algorithm with $\varepsilon = `r epsilon`$ and `minPTS`$= `r min_points`$.
+
+```{r, echo = TRUE}
+# Load the DBSCAN library
+library(dbscan)
+
+# Convert the shots sf object to a dataframe with the xy-coordinates
+shots_df <- data.frame(st_coordinates(shots_sf))
+
+# Run the dbscan algorithm
+db_naive <- dbscan(shots_df, eps = epsilon, MinPts = min_points)
+
+# Create an sf object with the shots and cluster ID
+clusters_sf <- st_as_sf(
+  x = shots_sf %>% 
+    mutate(cluster_id = db_naive$cluster) %>%
+    filter(cluster_id >= 1)
+  )
+```
+
+```{r db-naive, echo = FALSE, fig.cap = 'Not bad for a first attempt', out.width='100%', fig.align='center'}
+plot_court() +
+  geom_sf(data = shots_sf, alpha = 0.05) +
+  geom_sf(data = clusters_sf, aes(colour = factor(cluster_id)), alpha = 0.6) +
+  geom_label(aes(x = width/2, y = height - 2.5, label = "DBSCAN Clusters")) +
+  geom_text(aes(x = width/2, y = height - 3.5,
+                label = paste(
+                  "Radius =",
+                  epsilon,
+                  "meters & min.PTS =",  min_points))) +
+  theme(
+    plot.title = element_text(hjust = 0.5),
+    plot.subtitle = element_text(hjust = 0.5),
+    legend.position = "none"
+    )
+```
+
+Figure \@ref(fig:db-naive) displays the resulting clusters from the DBSCAN algorithm with parameters $\varepsilon =$ `r epsilon` and `minPTS`$= `r min_points`$. The results pass the __eye-test__. It found `r length(unique(clusters_sf$cluster_id))` clusters^[technically 9 clusters if you count the grey points as a cluster although they are noise] which appear to be located at spots that align with common basketball offensive strategies. Coaches often refer to the five locations around the three-point line as "getting to spots". It's also not surprising that there is a cluster for the left and right layup spots given that a significant proportions of shots in the sample were near the rim.
+
+Note that the algorithm also separated the three-point shots located $45^{\circ}$ on the right-side of the center line into two cluster. Figure \@ref(fig:naive-zoom) zooms in on this part of the court to look under the hood of the algorithm and try to figure out why this might have happened.
+
+```{r naive-zoom, echo = FALSE, fig.cap = 'Close up look at the DBSCAN algorithm', out.width='100%', fig.align='center'}
+set.seed(2021)
+sample_shots <- shots_sf %>% 
+  filter(
+    st_coordinates(shots_sf)[, 1] >= 2.4, st_coordinates(shots_sf)[, 1] <= 4,
+    st_coordinates(shots_sf)[, 2] >= 6.7, st_coordinates(shots_sf)[, 2] <= 7.85
+    ) %>%
+  sample_frac(0.1) %>%
+  mutate(shot_id = row_number())
+
+plot_court() +
+  geom_sf(data = st_buffer(sample_shots, dist = epsilon), 
+          colour = "#00000070", fill = NA) +
+    geom_sf_text(data = sample_shots, aes(label = shot_id)) +
+  geom_sf(data = shots_sf, alpha = 0.05) +
+  geom_sf(data = clusters_sf, aes(colour = factor(cluster_id)), alpha = 0.6) +
+  labs(
+    caption = paste("Radius =", epsilon, "meters & min.PTS =", min_points)
+  ) +
+  coord_sf(xlim = c(2.4, 4), ylim = c(6.7, 7.85)) +
+  theme(legend.position = "none")
+```
+
+As you can see from Figure \@ref(fig:naive-zoom), shot 1 only has __10 core points__ while shot 2  has __7 core points__. We know that the number of core points need to be greater than or equal to the `minPTS` parameter for a shot to be added to the cluster. Let's increase $\varepsilon$ or decrease `minPTS` as an attempt to merge these two clusters together. It is very unlikely that players voluntarily took shots in two spots just a few feet apart. It's much more likely that the two clusters are a result of luck and __measurement error__^[The measurement error can be up to 3 feet. The shot locations were tracked using the [Easy Stats](https://youtu.be/A4f4gioAnFg) application which requires the user to place a point on the screen that matches where the player's feet were when they released the shot. We can be quite confident that the shots beyond the three-point line were released from the three-point area. In other words, there is a bigger measurement error for the angle from the center line than for the shot distance of three-point shots.].
+
+### Tuned Results
+
+```{r}
+# Define the two parameters based on naive values
+epsilon <- 0.30
+min_points <- 15
+```
+
+After a few trying a few different combinations, it seems that $\varepsilon = `r epsilon`$ and `minPTS`$= `r min_points`$ gave the resulted in more useful results^[Useful here is loosely defined in terms of passing the eye-test.]. 
+
+```{r}
+# Run the dbscan algorithm
+db_tuned <- dbscan(shots_df, eps = epsilon, MinPts = min_points)
+
+# Create an sf object with the shots and cluster ID
+clusters_sf <- st_as_sf(
+  x = shots_sf %>% 
+    mutate(cluster_id = db_tuned$cluster) %>%
+    filter(cluster_id >= 1)
+  )
+```
+
+```{r db-tuned, echo = FALSE, fig.cap = 'Bigger clusters but still two separate ones on the top right', out.width='100%', fig.align='center'}
+plot_court() +
+  geom_sf(data = shots_sf, alpha = 0.05) +
+  geom_sf(data = clusters_sf, aes(colour = factor(cluster_id)), alpha = 0.6) +
+  geom_label(aes(x = width/2, y = height - 2.5, label = "DBSCAN Clusters")) +
+  geom_text(aes(x = width/2, y = height - 3.5,
+                label = paste(
+                  "Cluster Radius =",
+                  epsilon,
+                  "meters & Min. Points =",  min_points))) +
+  theme(
+    plot.title = element_text(hjust = 0.5),
+    plot.subtitle = element_text(hjust = 0.5),
+    legend.position = "none"
+    )
+```
+
+We can delimit the perimeter of our clusters by connecting the exterior points of our clusters. The technical term for this is to create a [convex hull](https://en.wikipedia.org/wiki/Convex_hull) around the clusters. The following analogy might be useful to better understand this concept. Think of the basketball court as a cork bulletin board. Now imagine that we placed colour-coded pins at the locations of the exterior shots of each cluster. The convex hull would be like placing an elastic around the pins of the same colour. This can easily be achieved using the `st_convex_hull()` function from the `sf` package.
+
+```{r, echo = TRUE}
+# Convert shots to an sf object
+hull_sf <- clusters_sf %>% 
+  group_by(cluster_id) %>%
+  summarise(geometry = st_combine(geometry)) %>%
+  st_convex_hull()
+```
+
+```{r db-tuned-convex, echo = FALSE, fig.cap = 'Try to visualize the pins and elastic analogy', out.width='100%', fig.align='center'}
+plot_court() +
+  geom_sf(data = shots_sf, alpha = 0.05) +
+  geom_sf(data = hull_sf, aes(fill=factor(cluster_id)), alpha = 0.6) +
+  geom_sf_text(data = hull_sf, aes(label = cluster_id)) +
+  geom_label(aes(x = width/2, y = height - 2.5, label = "DBSCAN Clusters")) +
+  geom_text(aes(x = width/2, y = height - 3.5,
+                label = paste(
+                  "Cluster Radius =",
+                  epsilon,
+                  "meters & Min. Points =",  min_points))) +
+  theme(
+    plot.title = element_text(hjust = 0.5),
+    plot.subtitle = element_text(hjust = 0.5),
+    legend.position = "none"
+    )
+```
+
+We can see from Figure \@ref(fig:db-tuned-convex) that the algorithm settled with 9 clusters with the new parameters. Cluster 9 and cluster 1 represent almost certainly the same true underlying pattern. If they would merge, then they would look similar to cluster 3 which is more representative of the signal. The clusters are larger as a result of the more generous initial parameters^[$\varepsilon = 0.3$ instead of 0.2 and `minPTS = 15` instead of 16]. Additionally, cluster 8 is a cluster that makes sense in terms of common shot locations.
+
+## Further Investigation
+
+[HDBSCAN](https://pberba.github.io/stats/2020/01/17/hdbscan/) is an extension of DBSCAN. A key difference between the two algorithms is that only the `minPTS` parameter needs to be specified for HDBSCAN. 
+
+```{r}
+# Define the minimum number of points based on naive values
+min_points <- 15
+```
+
+```{r, echo = TRUE}
+# Convert the shots sf object to a dataframe with the xy-coordinates
+hdb <- hdbscan(shots_df, minPts = min_points)
+
+# Create an sf object with the shots and cluster ID
+clusters_sf <- st_as_sf(
+  x = shots_sf %>% 
+    mutate(cluster_id = hdb$cluster) %>%
+    filter(cluster_id >= 1)
+  )
+```
+
+```{r hdb, echo = FALSE, fig.cap = 'Points leaking past the three-point line', out.width='100%', fig.align='center'}
+plot_court() +
+  geom_sf(data = shots_sf, alpha = 0.05) +
+  geom_sf(data = clusters_sf, aes(colour = factor(cluster_id)), alpha = 0.6) +
+  geom_label(aes(x = width/2, y = height - 2.5, label = "HDBSCAN Clusters")) +
+  geom_text(aes(x = width/2, y = height - 3.5,
+                label = paste("Min. Points =",  min_points))) +
+  theme(
+    plot.title = element_text(hjust = 0.5),
+    plot.subtitle = element_text(hjust = 0.5),
+    legend.position = "none"
+    )
+```
+
+Figure \@ref(fig:hdb) displays the results of HDBSCAN with `minPTS`$= `r min_points`$. It appears that some of the long mid-range shots were lumped in the three-point clusters. We could try to improve the clustering performance by feeding the algorithm other numeric information such as whether the shot was worth two or three points, the shot distance, and the shot angle in addition to only using the shot coordinates^[refer to Chapter \@ref(shots-data) to review how we calculated all these measures]. Lastly, it might be useful to apply this clustering technique to individual player's shots. We could try to compare where different players shoot from and see it the cluster locations match the strategy implemented by the coaching staff. 
+
+The next chapter will build on the ideas proposed in this chapter. Instead of trying to classify shots into clusters, we will try to calculate a density value for every spot on the court to see where the shots are coming from through another lens. Finally, the next chapter will attempt to find spots on the court where the players in the sample were the most accurate.
+
+__Note that all the ```R``` code used in this book is accessible on [GitHub](https://github.com/olivierchabot17/ballbook).__
+
+

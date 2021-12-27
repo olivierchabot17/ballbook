@@ -1,0 +1,670 @@
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE)
+```
+
+# Spatial Interpolation with GAMs {#gam}
+
+__Note that all the ```R``` code used in this book is accessible on [GitHub](https://github.com/olivierchabot17/ballbook).__
+
+The density plots from Chapter \@ref(density) were effective at telling us where the shots are coming from but not so great at telling us where the team is shooting accurately from. Figure \@ref(fig:hot-heat), the last figure from the previous chapter, attempts to address this accuracy issue but fails to provide uncertainty estimates for its predictions. As a result, we will use our modeling skills developed in Chapter \@ref(model) to build spatial models. In particular, we'll use [Generalized Additive Models](https://en.wikipedia.org/wiki/Generalized_additive_model) (GAMs) to conduct our spatial interpolation. 
+
+Again, let's load the larger [dataset](https://github.com/olivierchabot17/ballbook). We will need as much data as possible to "accurately" predict the shooting percentage for every spot on the floor even for locations that do not have many or any shots. 
+
+```{r}
+# Load libraries
+library(tidyverse)
+library(sf)
+library(mgcv)
+library(broom)
+library(raster)
+library(viridis)
+library(metR)
+library(plotly)
+library(gridExtra)
+
+# Load the plot_court() function from the previous chapters
+source("code/court_themes.R")
+source("code/fiba_court_points.R")
+# Load the different zone polygon objects
+source("code/zone_polygons.R")
+```
+
+```{r, echo = TRUE}
+# Load the larger dataset
+shots_tb <- readRDS(file = "data/shots_3000_tb.rds")
+
+# Load large spatial shots data
+shots_sf <- readRDS(file = "data/shots_3000_sf.rds")
+```
+
+```{r}
+interpolation <- shots_sf %>% st_union() %>% st_convex_hull()
+
+extrapolation <- st_difference(half_court, interpolation)
+```
+
+```{r inter-vs-extra, fig.cap = 'Interpolation versus Extrapolation', out.width='100%', fig.align='center'}
+plot_court() +
+  geom_sf(data = interpolation, alpha = 0.6) +
+  geom_sf(data = extrapolation, alpha = 0.6, fill = "red") +
+  geom_sf(data = shots_sf %>% st_union() %>% st_convex_hull(),
+          alpha = 0.6) +
+  geom_sf(data = shots_sf, aes(color = shot_made_factor),
+          alpha = 0.1, size = 1) +
+  # Red = Miss, Green = Make
+  scale_color_manual(values = c("red", "green")) +
+  # Remove legend title
+  theme(legend.title = element_blank()) +
+  geom_label(aes(x = width/2, y = height - 1,
+                label = "Extrapolation"),
+            fontface = "bold", fill = "indianred1"
+            ) +
+  geom_label(aes(x = width/2 , y = key_height,
+                label = "Interpolation"),
+            fontface = "bold"
+            )
+
+
+```
+__Interpolation__ would be to predict the accuracy of every possible $(x, ~y)$ coordinate inside of the convex hull surrounding the shots in Figure \@ref(fig:inter-vs-extra) (the grey region). Predictions in the red region would be an example of __extrapolation__. 
+
+```{r}
+range_cut_off <- 8.5
+```
+
+The data is too sparse for shots further than `r range_cut_off`  meters from the hoop and for shots below the backboard to make any reasonable inference about their likelihood of going in. Thus, we'll focus our analysis on the region displayed in Figure \@ref(fig:sparse).
+
+```{r}
+# Data is too sparse past 9 meters
+near_shots = shots_tb[shots_tb$dist_meters < range_cut_off, ]
+
+# Data is too sparse below backboard
+near_shots = near_shots[near_shots$loc_y >= backboard_offset - backboard_thick, ]
+
+# Define the window as an sf object
+near_window <- st_crop(
+    st_sfc(st_buffer(hoop_center, dist = range_cut_off)),
+    xmin = 0, ymin = backboard_offset - backboard_thick,
+    xmax = width, ymax = height
+  )
+```
+
+```{r sparse, fig.cap = 'Only focus on the shots within the region of interest', out.width='100%', fig.align='center'}
+plot_court() +
+  geom_sf(data = near_window, fill = "grey", color = "red", linetype = "dashed", alpha = 0.6) +
+  geom_sf(data = shots_sf, aes(color = shot_made_factor),
+          alpha = 0.1, size = 1) +
+  # Red = Miss, Green = Make
+  scale_color_manual(values = c("red", "green")) +
+  # Remove legend title
+  theme(legend.title = element_blank()) +
+  geom_text(aes(x = width/2, y = height - 2.5,
+                 label = paste(
+                   nrow(shots_tb),
+                   "Shots ==>",
+                   nrow(near_shots),
+                   "Shots"
+                   )),
+            fontface = "bold"
+            )
+```
+
+## Team Level 
+
+A team might be interested in trying to answer two questions:
+
+1. What is the team's accuracy from every spot on the half-court?
+
+2. How does a specific player's shot-making abilities compare to the rest of the team?
+
+We will start by attempting to answer the __first question__ using GAMs. Much of the analysis of this chapter is based on Noam Ross' free interactive course: [GAMs in R](https://noamross.github.io/gams-in-r-course/). 
+
+### Coordinates Only Model
+
+Let's fit a GAM model using the $(x, ~y)$ coordinates to predict the binary outcome of the shots. Note that this ignores who took the shot and all other potentially relevant variables.
+
+> "A common way to model geospatial data is to use an interaction term of x and y coordinates, along with individual terms for other predictors. The interaction term then accounts for the spatial structure of the data."  — [Noam Ross - GAMs in R (Chapter 3)](https://noamross.github.io/gams-in-r-course/chapter3)
+
+```{r, echo = TRUE, cache = TRUE}
+# Load the mgcv library to fit GAM models
+library(mgcv)
+
+# GAM model based on shot coordinates
+coord_mod <- gam(
+  shot_made_numeric ~ s(loc_x, loc_y),
+  data = near_shots, method = "REML", family = binomial)
+```
+
+```{r}
+# Summary of the model
+summary(coord_mod)
+
+# Other model evaluation metrics
+glance(coord_mod)
+```
+
+We see that both the intercept and the interaction term `s(loc_x, loc_y)` have very __small p-values__ which means that there's a significant relationship between whether a shot was made or not and the location of that shot. The __effective degrees of freedom__ `edf` = `r summary(coord_mod)$edf` "represents the complexity of the smooth. An edf of 1 is equivalent to a straight line. An edf of 2 is equivalent to a quadratic curve, and so on, with higher edfs describing more wiggly curves."^[[GAMs in R](https://noamross.github.io/gams-in-r-course/), Chapter 1, Noam Ross]
+
+
+It's important to note that outputs of our model summary are on the __log-odds scale__. As seen in Chapter \@ref(model), we can use the logistic function to convert the log-odds to probabilities. Here, the value of the intercept is `r summary(coord_mod)$p.coeff`. We can use the `plogis()` function to convert it to a probability.
+
+```{r}
+# This makes sense given that the overall shooting percentage of the sample is `r round(mean(near_shots$shot_made_numeric)*100, digits = 2)`%.
+```
+
+$$
+\mbox{logit}^{-1}(`r summary(coord_mod)$p.coeff`) = \frac{e^{`r summary(coord_mod)$p.coeff`}}{e^{`r summary(coord_mod)$p.coeff`} + 1} = `r exp(summary(coord_mod)$p.coeff) / (exp(summary(coord_mod)$p.coeff) + 1)`
+$$
+
+On the probability-scale, the intercept is about `r round(plogis(summary(coord_mod)$p.coeff), digits = 2)`. This means that the model predicts a  `r round(plogis(summary(coord_mod)$p.coeff)*100, digits = 2)`% baseline chance of a made shot. This makes sense given that the overall shooting percentage of the sample is roughly `r round(mean(near_shots$shot_made_numeric)*100)`%.
+
+We can easily visualize our model results using the `plot()` function as shown in Figure \@ref(fig:log-odds) below. "The interior is a topographic map of predicted values. The contour lines represent points of equal predicted values, and they are labeled. The dotted lines show uncertainty in prediction; they represent how contour lines would move if predictions were one standard error higher or lower."^[[GAMs in R](https://noamross.github.io/gams-in-r-course/), Chapter 3, Noam Ross]
+
+```{r log-odds, echo = TRUE, fig.cap = 'Not a very useful plot...', out.width='100%', fig.align='center'}
+plot(coord_mod, asp = 1)
+```
+
+Recall that the predicted values are on the log-odds scale by default. The contour line with a value of $0$ in Figure \@ref(fig:log-odds) indicates a region with a $50$% chance of making a basket. Contour lines with a value of $-0.5$ represent a `r round(plogis(-0.5)*100)`% chance of a successful outcome. Similarly, the contours near the rim have log-odds values between $0.5$ and $1$ which would correspond to probabilities between `r round(plogis(0.5)*100)`% and `r round(plogis(1)*100)`%. This makes sense given our previous knowledge of basketball shots.
+
+We can easily improve the readability of Figure \@ref(fig:log-odds) by setting the `trans` argument to `plogis` to convert the log-odds to probabilities. Setting the `scheme` argument to $2$ creates a heat map with contour lines. We can add a point centered at the rim to add a reference point. The location of the three-point line is evident from the cloud of points surrounding it.
+
+```{r prob-scale, echo = TRUE, fig.cap = 'Much more useful plot!', out.width='100%', fig.align='center'}
+plot(coord_mod, trans = plogis, scheme = 2, asp = 1)
+points(x = width/2, y = hoop_center_y, col = "black", pch = 1, cex = 2.5)
+```
+
+We see from Figure \@ref(fig:prob-scale) that the accuracy of the shots decreases rapidly as we move away from the basket. Right-handed layups seem to be slightly more accurate than left-handed layups. Other than that, the accuracy is roughly symmetric between the left and right side of the court.
+
+It requires a bit of creativity to plot the outputs of our model on the basketball court we built using `ggplot2`^[Refer to the `plot_court()` function from Chapter \@ref(court).]. [Dr. Barry Rowlingson](http://barry.rowlingson.com/) is to thank for some of the [code](https://github.com/olivierchabot17/ballbook) used to create the next few charts. Their [DataCamp course](https://app.datacamp.com/learn/courses/spatial-statistics-in-r) on __Spatial Statistics in R__ has also been of great help throughout the book.
+
+```{r}
+# Define a function that creates a grid given a df of shots
+make_grid <- function(shots, xs = 0.2, ys = 0.2){
+  xrange = range(shots$loc_x)
+  yrange = range(shots$loc_y)
+  
+  loc_x = seq(xrange[1], xrange[2], by=xs)
+  loc_y = seq(yrange[1], yrange[2], by=ys)
+  grid = expand.grid(loc_x=loc_x, loc_y=loc_y)
+  # if you need other variables in your model compute them here:
+  grid$dist_meters = sqrt((grid$loc_x - width/2)^2 + (grid$loc_y - hoop_center_y)^2)
+  grid$theta_rad_full = case_when(
+    #QI
+    grid$loc_x >  width /2 & grid$loc_y >= hoop_center_y ~ atan((hoop_center_y - grid$loc_y) / (width/2 - grid$loc_x)),
+    # QII
+    grid$loc_x <= width /2 & grid$loc_y >= hoop_center_y ~ pi + atan((hoop_center_y - grid$loc_y) / (width/2 - grid$loc_x)),
+    # QIII
+    grid$loc_x <= width /2 & grid$loc_y < hoop_center_y ~ pi + atan((hoop_center_y - grid$loc_y) / (width/2 - grid$loc_x)),
+    # QIV
+    grid$loc_x > width /2 & grid$loc_y < hoop_center_y ~ 2*pi + atan((hoop_center_y - grid$loc_y) / (width/2 - grid$loc_x))
+    
+  ) 
+  return(list(loc_x = loc_x, loc_y = loc_y, grid = grid))
+}
+
+# create a 20 cm by 20 cm
+near_grid = make_grid(near_shots)
+
+prediction_data = predict(
+  coord_mod, 
+  newdata = near_grid$grid,
+  se.fit = TRUE,
+  type = "link"
+  ) 
+
+# Convert the prediction data into a matrix
+prediction_matrix = matrix(
+  prediction_data$fit,
+  ncol = length(near_grid$loc_y)
+  )
+
+prediction_data <- near_grid$grid %>%
+  transmute(
+    loc_x, loc_y, dist_meters, theta_rad_full,
+    theta_deg_full = theta_rad_full * (180/pi),
+    make_log_odds = prediction_data$fit,
+    se_log_odds = prediction_data$se.fit,
+    low_pred = make_log_odds - 2*se_log_odds,
+    high_pred = make_log_odds + 2*se_log_odds,
+    low_prob = plogis(low_pred),
+    high_prob = plogis(high_pred),
+    make_prob = plogis(make_log_odds),
+    # +- 2*se so we will divide by 4 
+    se_prob = (high_prob - low_prob) /4
+  )
+
+pred_data_sf <- st_as_sf(
+  prediction_data,
+  coords = c("loc_x", "loc_y")
+)
+
+prediction_data <- pred_data_sf %>%
+  st_join(point_polys) %>%
+  st_drop_geometry() %>%
+  transmute(
+    loc_x = st_coordinates(pred_data_sf)[ , 1],
+    loc_y = st_coordinates(pred_data_sf)[ , 2],
+    dist_meters, theta_rad_full, theta_deg_full,
+    make_log_odds, se_log_odds, low_pred, high_pred,
+    low_prob, high_prob, make_prob, se_prob,
+    shot_value = ifelse(area_value == "Three-Point Area", 3, 2),
+    x_points = make_prob * shot_value
+  )
+
+# # Convert matrix into a raster of percentages by multiplying probs by 100:
+# library(raster)
+# raster_percent = raster(list(
+#   x = near_grid$loc_x,
+#   y = near_grid$loc_y,
+#   z = prediction_matrix*100
+#   ))
+# 
+# plot(raster_percent)
+# points(x = near_shots$loc_x, y = near_shots$loc_y, cex = 0.1, alpha = 0.2)
+# contour(raster_percent, add = TRUE)
+```
+
+```{r, eval=FALSE}
+sf_grid <- st_make_grid(
+  near_window,
+  #square = FALSE,
+  cellsize = 1
+  )
+  #st_intersection(near_window)
+
+
+
+plot_court() +
+  geom_sf(data = sf_grid, fill = NA, col = "red") +
+  geom_sf(data = st_centroid(sf_grid), fill = NA, col = "red", alpha = 0.2)
+
+test_grid <- expand.grid(
+  loc_x = st_coordinates(st_centroid(sf_grid))[ , 1],
+  loc_y = st_coordinates(st_centroid(sf_grid))[ , 1]
+  ) %>%
+  distinct() %>%
+  mutate(
+    dist_meters = sqrt(
+      (loc_x - width/2)^2 + (loc_y - hoop_center_y)^2
+      ),
+    theta_rad_full = case_when(
+    #QI
+    loc_x >  width /2 & loc_y >= hoop_center_y ~
+      atan((hoop_center_y - loc_y) / (width/2 - loc_x)),
+    # QII
+    loc_x <= width /2 & loc_y >= hoop_center_y ~ 
+      pi + atan((hoop_center_y - loc_y) / (width/2 - loc_x)),
+    # QIII
+    loc_x <= width /2 & loc_y < hoop_center_y ~ 
+      pi + atan((hoop_center_y - loc_y) / (width/2 - loc_x)),
+    # QIV
+    loc_x > width /2 & loc_y < hoop_center_y ~ 
+      2*pi + atan((hoop_center_y - loc_y) / (width/2 - loc_x))
+  )
+  )
+
+prediction_data = predict(
+  coord_mod, 
+  newdata = test_grid,
+  type = "response", se.fit = TRUE
+  )
+
+# Convert the prediction data into a matrix
+prediction_matrix = matrix(
+  prediction_data$fit,
+  ncol = length(unique(test_grid$loc_y))
+  )
+
+df <- test_grid %>%
+  mutate(
+  theta_deg_full = theta_rad_full * (180/pi),
+  make_prob = prediction_data$fit,
+  se_prob = prediction_data$se.fit
+  ) %>%
+  distinct()
+
+df[1, ] == df[16, ]
+
+library(viridis)
+library(metR)
+plot_court() +
+  geom_tile(data = df, aes(loc_x, loc_y, fill = make_prob)) +
+  geom_sf(data = court_sf, fill = court_themes$light$lines,
+          col = court_themes$light$lines) +
+  geom_label(
+    aes(x = width/2, y = height - 3,label = "(x, y) GAM Model"),
+    fill = "grey", fontface = "bold", size = 8, label.padding = unit(0.5, "lines")) +
+  geom_contour(data = df, aes(loc_x, loc_y, z = make_prob),
+               #breaks = seq(from = 0, to = 1, by = 0.05),
+               colour = "orange", linetype = "dashed") +
+  geom_text_contour(data = df, aes(loc_x, loc_y, z = make_prob),
+                     #breaks = seq(from = 0, to = 1, by = 0.05),
+                     colour = "orange", alpha = 1
+                     ) +
+  scale_fill_viridis(
+    name = "FG%",
+    breaks = seq(from = 0, to = 1, by = 0.1),
+    labels = scales::percent_format(accuracy = 1)
+    ) +
+  theme(
+    legend.position = "right"
+  )
+
+```
+
+```{r gg-coord-se, fig.cap = 'Less Shots = More Error!', out.width='100%', fig.align='center'}
+library(gridExtra)
+library(viridis)
+library(metR)
+
+p1 <- plot_court() +
+  geom_tile(data = prediction_data, aes(loc_x, loc_y, fill = make_prob*100)) +
+  geom_sf(data = court_sf, fill = court_themes$light$lines,
+          col = court_themes$light$lines) +
+  geom_text(
+    aes(x = width/2, y = height - 2.5,label = "(x, y) GAM Model"),
+    fontface = "bold", size = 7) +
+  geom_contour(data = prediction_data, aes(loc_x, loc_y, z = make_prob*100),
+               #breaks = seq(from = 0, to = 1, by = 0.05),
+               colour = "white", linetype = "dashed", alpha = 0.2) +
+  geom_text_contour(data = prediction_data,
+                    aes(loc_x, loc_y, z = make_prob*100),
+                     #breaks = seq(from = 0, to = 1, by = 0.05),
+                     colour = "white", alpha = 1
+                     ) +
+  scale_fill_viridis(
+    name = "FG%",
+    breaks = seq(from = 0, to = 100, by = 10)
+    #breaks = seq(from = 0, to = 1, by = 0.1),
+    #labels = scales::percent_format(accuracy = 1)
+    ) +
+  theme(
+    legend.position = "top"
+  )
+
+p2 <- plot_court() +
+  geom_tile(data = prediction_data, aes(loc_x, loc_y, fill = se_prob*100)) +
+  geom_sf(data = court_sf, fill = court_themes$light$lines,
+          col = court_themes$light$lines) +
+  geom_sf(data = shots_sf, alpha = 0.8, size = 0.1) +
+  geom_text(
+    aes(x = width/2, y = height - 2.5,label = "(x, y) Model Error"),
+    fontface = "bold", size = 7) +
+  geom_contour(data = prediction_data, aes(loc_x, loc_y, z = se_prob*100),
+               #breaks = seq(from = 0, to = 1, by = 0.05),
+               colour = "white", linetype = "dashed", alpha = 0.2) +
+  geom_text_contour(data = prediction_data,
+                    aes(loc_x, loc_y, z = round(se_prob*100)),
+                     #breaks = seq(from = 0, to = 1, by = 0.05),
+                     colour = "white", alpha = 1
+                     ) +
+  scale_fill_viridis(
+    name = "SE",
+    breaks = seq(from = 0, to = 100, by = 5),
+    # labels = scales::percent_format(accuracy = 1)
+    ) +
+  theme(
+    legend.position = "top"
+  )
+
+# plot 2 plots side-by-side
+grid.arrange(p1, p2, ncol=2, nrow =1)
+```
+
+The plot on the __left__ of Figure \@ref(fig:gg-coord-se) displays the shooting percentage for all locations in the region of interest. By default, our function splits the region of interest into a grid of 20 cm by 20 cm cells. The cells can be smaller if a smoother picture is required. Again, we see that the shots near the rim have a higher success probability. There is no obvious pattern for the rest of the half-court.
+
+The plot on the __right__ of Figure \@ref(fig:gg-coord-se) displays the __uncertainty__ (standard error) of our predictions. As expected, the regions with many shots have low uncertainty while the sparse regions have high uncertainty. The yellow spots in the top-corners of the plot have high uncertainty since there are little to no shots in those regions. Thus, the model is trying to extrapolate too far from the regions of high-information.
+
+```{r too-far, fig.cap = 'Oops! That might have been too far...', out.width='100%', fig.align='center'}
+vis.gam(
+  x = coord_mod,
+  view = c("loc_x", "loc_y"),
+  plot.type = "contour",
+  too.far = 0.05,
+  type = "response"
+  )
+points(x = near_shots$loc_x, y = near_shots$loc_y,
+       col = "black", pch = 1, cex = 0.2)
+```
+
+We can use the `vis.gam()` function from the `mgcv` package to prevent the plot from extrapolating too far from our data. Figure \@ref(fig:too-far) above has the `too.far` argument set to $0.05$. We see that the regions of the court without any points nearby are simply plotted as white squares. This approach only takes into account the distance of a shot to it's neighbours. 
+
+```{r}
+se_threshold <- 0.07
+```
+
+Hence, it may be a better approach to only plot the grid cells that have a standard error under a specific threshold. Figure \@ref(fig:gg-se) below only plots the predictions with a __standard error__ less than `r se_threshold*100`. This is a pretty good way of limiting the grandiosity of our claims given the significant uncertainty of our estimates. We could easily improve on these models and plots given more data in the sparse regions. This is where tracking a team's practice data may come in handy.
+
+```{r gg-se, fig.cap = 'Only show the confident predictions.', out.width='100%', fig.align='center'}
+plot_court() +
+  geom_tile(data = prediction_data %>% filter(se_prob < se_threshold)
+            , aes(loc_x, loc_y, fill = make_prob*100)) +
+  geom_sf(data = court_sf, fill = court_themes$light$lines,
+          col = court_themes$light$lines) +
+  geom_sf(data = shots_sf, alpha = 0.8, size = 0.1) +
+  geom_text(
+    aes(x = width/2, y = height - 2.5,label = "(x, y) Model FG%"),
+    fontface = "bold", size = 7) +
+  geom_contour(data = prediction_data, aes(loc_x, loc_y, z = make_prob*100),
+               #breaks = seq(from = 0, to = 1, by = 0.05),
+               colour = "white", linetype = "dashed", alpha = 0.2) +
+  geom_text_contour(data = prediction_data,
+                    aes(loc_x, loc_y, z = make_prob*100),
+                     #breaks = seq(from = 0, to = 1, by = 0.05),
+                     color = "white", alpha = 1
+                     ) +
+  scale_fill_viridis(
+    name = "FG%",
+    breaks = seq(from = 0, to = 100, by = 10),
+    # labels = scales::percent_format(accuracy = 1)
+    ) +
+  theme(
+    legend.position = "right"
+  )
+```
+
+We can also visualize the smoothed shooting percentage in three dimensions as shown in Figure \@ref(fig:gg-coord-plotly) below. Just note that the left-right coordinates appear to be reflected for some reason. Plotting the basketball court under the 3D surface would greatly help with interpretation.
+
+```{r gg-coord-plotly, fig.cap = 'Difficult to interpret without the court', out.width='100%', fig.align='center'}
+# https://plotly.com/r/3d-surface-plots/
+library(plotly)
+
+FG <- plogis(prediction_matrix)*100
+fig <- plot_ly(z = ~ FG)
+fig <- fig %>% add_surface()
+#fig <- fig %>% layout(scene = list(xaxis=axy,yaxis=axx,zaxis=axz))
+fig <- fig%>% 
+    layout(
+      # title = "TITLE",
+      scene = list(
+            xaxis = list(title = "loc_y"), 
+            yaxis = list(title = "loc_x"), 
+            zaxis = list(title = "FG%")))
+
+fig
+```
+
+Another way to get a sense of where the best spots to shoot from is to find the areas with the greatest values of __expected points per shot__.
+
+$$
+\mbox{Expected Points per Shot} = \mbox{xPPS} = \mbox{Shooting Percentage} \times \mbox{Shot Value}
+$$
+
+Shooting $40$% from the three-point area results in $0.4 \times 3 = 1.2$ points per shot while shooting $55$% from the two-point area results in $0.55 \times 2 = 1.1$ points per shot. This means that the average three-pointer was more __efficient__ than the average two-pointer for this example.  As seen in the first chapter, the shooting percentage of a two-point shooter needs to be __1.5 times greater__ than the shooting percentage of a three-point shooter for the expected points per shot to be equal. 
+
+```{r gg-coord-xpoints, fig.cap = 'The three-point range comes alive!', out.width='100%', fig.align='center'}
+p1 <- plot_court() +
+  geom_tile(data = prediction_data %>% filter(se_prob < se_threshold), 
+            aes(loc_x, loc_y, fill = make_prob*100)) +
+  geom_sf(data = court_sf, fill = court_themes$light$lines,
+          col = court_themes$light$lines) +
+  geom_text(
+    aes(x = width/2, y = height - 2.5,label = "(x, y) Model FG%"),
+    fontface = "bold", size = 7) +
+  geom_contour(data = prediction_data, aes(loc_x, loc_y, z = make_prob*100),
+               #breaks = seq(from = 0, to = 1, by = 0.05),
+               colour = "white", linetype = "dashed", alpha = 0.2) +
+  geom_text_contour(data = prediction_data,
+                    aes(loc_x, loc_y, z = make_prob*100),
+                     #breaks = seq(from = 0, to = 1, by = 0.05),
+                     colour = "grey", alpha = 1
+                     ) +
+  scale_fill_viridis(
+    name = "FG%",
+    breaks = seq(from = 0, to = 100, by = 10)
+    #breaks = seq(from = 0, to = 1, by = 0.1),
+    #labels = scales::percent_format(accuracy = 1),
+    ) +
+  theme(
+    legend.position = "top"
+  )
+
+p2 <- plot_court() +
+  geom_tile(data = prediction_data %>% filter(se_prob < se_threshold),
+            aes(loc_x, loc_y, fill = x_points)) +
+  geom_sf(data = court_sf, fill = court_themes$light$lines,
+          col = court_themes$light$lines) +
+  #geom_sf(data = shots_sf, alpha = 0.8, size = 0.1) +
+  geom_text(
+    aes(x = width/2, y = height - 2.5,label = "(x, y) Expected Points"),
+    fontface = "bold", size = 7) +
+  geom_contour(data = prediction_data, aes(loc_x, loc_y, z = x_points),
+               #breaks = seq(from = 0, to = 1, by = 0.05),
+               colour = "white", linetype = "dashed", alpha = 0.2) +
+  geom_text_contour(data = prediction_data,
+                    aes(loc_x, loc_y, z = x_points),
+                     #breaks = seq(from = 0, to = 1, by = 0.05),
+                     colour = "grey", alpha = 1
+                     ) +
+  scale_fill_viridis(
+    name = "xPPS",
+    breaks = seq(from = 0, to = 3, by = 0.2),
+    # labels = scales::percent_format(accuracy = 1)
+    ) +
+  theme(
+    legend.position = "top"
+  )
+
+# plot 2 plots side-by-side
+grid.arrange(p1, p2, ncol=2, nrow =1)
+```
+
+It's not obvious where the most efficient places to shoot from are when looking at the shooting percentage plot on the left of Figure \@ref(fig:gg-coord-xpoints). The only spot that stands out are the layups in bright yellow. We see that the average layup has a success probability of around $65$% while the rest the half-court's accuracy hovers between $30$% and $45$%. 
+
+It's a different story if we look at the plot on the right of Figure \@ref(fig:gg-coord-xpoints). The region past the three-point line has comparable expected points per shot values than layups. The corner-threes are efficient options as well even though the right-corner seems to be slightly less efficient for the shots in our sample. The mid-range is relatively dark which indicates a lower quality of shots.
+
+
+
+```{r, eval = FALSE}
+# ### Distance & Angle Model
+# 
+# polar coordinates should be similar if not equivalent to coordinates model. We know shot distance affects accuracy.The angle not so much for shots further than 8 feet.
+```
+
+## Player Level
+
+We will now tackle the second question posed earlier in the chapter.
+
+> How does a specific player's shot-making abilities compare to the rest of the team?
+
+The model built using only the $(x, ~y)$ coordinates of the shots failed to take into account who is shooting. A knowledgeable observer can make a reasonable guess at how likely a specific player is to make a shot given where they shoot from. Different players will likely have different success rates when shooting from the same locations. Of course, there are more factors that affect the probability of making shots other than the location and the shooter. The distance to the closest defender, the time remaining on the shot clock, and the player's speed prior to the shot are a few examples of variables that might help predict whether a shot will go in or not.
+
+Nevertheless, let's fit a GAM model using the $(x, ~y)$ coordinates of the shots and the player as our __three predictor variables__ to predict the binary outcome of the shot. By setting the `bs` argument of the `gam()` function to `fs`, we can model the categorical-continuous interaction between the player and the $(x, ~y)$ coordinates of the shots.
+
+> "With factor-smooths, we do not get a different term for each level of the categorical variable. Rather, we get one overall interaction term. This means that they are not as good for distinguishing between categories. However, factor smooths are good for controlling for the effects of categories that are not our main variables of interest, especially when there are very many categories, or only a few data points in some categories."  — [Noam Ross - GAMs in R (Chapter 3)](https://noamross.github.io/gams-in-r-course/chapter3)
+
+The factor-smooth approach seems to be perfect for our application. We do not care to have a term for each player. We can look at the raw shooting percentages if we wanted to rank players. Instead, we want to see how the accuracy of different players varies by location. It is also important to note that some of the players took very few shots compared to others which makes the factor-smooth approach that much more appealing. 
+
+```{r, echo = TRUE, cache = TRUE}
+coord_player_mod <- gam(
+  shot_made_numeric ~ s(loc_x, loc_y, player, bs = "fs"),
+  data = near_shots, method = "REML", family = binomial)
+```
+
+```{r}
+# Summary of the model
+summary(coord_player_mod)
+
+# Other model evaluation metrics
+glance(coord_player_mod)
+```
+
+We see that both the intercept and the interaction term are significant. Since this model differentiates its predictions based on who is shooting the ball, we can create a shot chart for each player and make the colour of the dots representative of the __expected points per shot__ for the specific player and location. Figure \@ref(fig:x-points-guard) displays such maps for the six __guards__ who took the most shots in the sample.
+
+```{r}
+coord_player_df <- augment(coord_player_mod, type.predict = "response") %>%
+  inner_join(near_shots) %>%
+  mutate(
+    actual_points = shot_made_numeric * shot_value,
+    x_points = .fitted * shot_value
+  )
+  
+
+shots_threshold <- 100
+
+volume_shots <- function(data, min_shots){
+  qualified_players <- data %>%
+    group_by(player) %>%
+    summarise(
+      n_shots = n()
+    ) %>%
+    filter(n_shots >= min_shots) %>%
+    pull(player)
+  
+  qualified_shots <- data %>%
+    filter(player %in% qualified_players)
+  
+  return(qualified_shots)
+}
+
+qualified_shots <- volume_shots(
+  data = coord_player_df,
+  min_shots = shots_threshold
+  )
+```
+
+```{r x-points-guard, fig.cap = 'Comparing the six guards who take the most shots', out.width='100%', fig.align='center'}
+plot_court() +
+  geom_point(data = qualified_shots %>% filter(position == "Guard"),
+             aes(x = loc_x, y = loc_y, fill = x_points),
+             colour = "black", pch=21) +
+  scale_fill_viridis(
+    name = "xPPS",
+    breaks = seq(from = 0, to = 3, by = 0.2),
+    # labels = scales::percent_format(accuracy = 1)
+    ) +
+  theme(
+    legend.position = "right"
+  ) +
+  facet_wrap(vars(player)) +
+  theme(
+    strip.text = element_text(size=20,face = "bold.italic")
+  )
+```
+
+We see that the predictions (colours) differ significantly across players at the same location. Figure \@ref(fig:x-points-post) compares the predicted efficiency of the __post__ players. We see for example that __Player 10__ is predicted to be more efficient near the rim while __Player 7__ is more efficient at the top of the arc.
+
+```{r x-points-post, fig.cap = 'Comparing the six posts who take the most shots', out.width='100%', fig.align='center'}
+plot_court() +
+  geom_point(data = qualified_shots %>% filter(position == "Post"),
+             aes(x = loc_x, y = loc_y, fill = .fitted),
+             colour = "black", pch=21) +
+  scale_fill_viridis(
+    name = "xPPS",
+    breaks = seq(from = 0, to = 3, by = 0.2),
+    # labels = scales::percent_format(accuracy = 1)
+    ) +
+  theme(legend.position = "right") +
+  facet_wrap(vars(player)) +
+  theme(
+    strip.text = element_text(size=20,face = "bold.italic")
+  )
+```
+
+The factor-smooth model from the section above provides evidence for the basic intuition that some players are better at shooting from some locations than others. Given more data, building separate models for each player could improve the predictability of our current model. 
+
+We will see in the next chapter how we can use these models to try to quantify the __shot making__ ability of players relative to their teammates.
+
+__Note that all the ```R``` code used in this book is accessible on [GitHub](https://github.com/olivierchabot17/ballbook).__
+
+

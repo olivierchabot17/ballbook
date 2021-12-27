@@ -1,0 +1,1142 @@
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE)
+```
+
+# The Landscape of Modern Basketball {#density}
+
+__Note that all the ```R``` code used in this book is accessible on [GitHub](https://github.com/olivierchabot17/ballbook).__
+
+## Motivation
+
+In the previous chapter, we saw how we can group shots into clusters based on their local density (as shown in the left plot of Figure \@ref(fig:cluster-heat)). In this chapter, we will attempt to quantify and visualize the local density at every spot on the half-court (as shown in the right plot of Figure \@ref(fig:cluster-heat)). This approach should hopefully create a more informative depiction of where the shots are coming from. Furthermore, we will see how we can use these density estimates to identify the best spots to shoot from, to generate artificial shot locations, and to visualize the basketball court as a mountain range.
+
+```{r, echo = FALSE}
+# Load libraries
+library(dbscan)
+library(spatstat)
+library(tidyverse)
+library(sf)
+library(sp)
+library(ggExtra)
+library(viridis)
+library(gridExtra)
+library(MASS)
+library(kableExtra)
+library(plotly)
+
+# Load the plot_court() function from the previous chapters
+source("code/court_themes.R")
+source("code/fiba_court_points.R")
+# Load the different zone polygon objects
+source("code/zone_polygons.R")
+
+# Load shot data
+shots <- readRDS(file = "data/shots_augmented.rds")
+
+# Load shot spatial data
+shots_sf <- readRDS(file = "data/shots_sf.rds")
+
+# Load the larger dataset
+shots_3000_tb <- readRDS(file = "data/shots_3000_tb.rds")
+
+# Load large spatial shots data
+shots_3000_sf <- readRDS(file = "data/shots_3000_sf.rds")
+```
+
+```{r cluster-heat, fig.cap = 'Moving away from Yes/No to something more nuanced', out.width='100%', fig.align='center'}
+# Define the two parameters based on naive values
+epsilon <- 0.30
+min_points <- 15
+
+# Convert the shots sf object to a dataframe with the xy-coordinates
+shots_df <- data.frame(st_coordinates(shots_sf))
+
+# Run the dbscan algorithm
+db_naive <- dbscan(shots_df, eps = epsilon, MinPts = min_points)
+
+# Create an sf object with the shots and cluster ID
+clusters_sf <- st_as_sf(
+  x = shots_sf %>% 
+    mutate(cluster_id = db_naive$cluster) %>%
+    filter(cluster_id >= 1)
+  )
+
+p1 <- plot_court() +
+  geom_sf(data = shots_sf, alpha = 0.05) +
+  geom_sf(data = clusters_sf, aes(colour = factor(cluster_id)), alpha = 0.6) +
+  geom_label(aes(x = width/2, y = height - 2.5,
+                 label = "DBSCAN Clusters")) +
+  geom_text(aes(x = width/2, y = height - 3.5,
+                label = paste(
+                  "Cluster Radius =",
+                  epsilon,
+                  "meters & Min. Points =",  min_points))) +
+  theme(
+    plot.title = element_text(hjust = 0.5),
+    plot.subtitle = element_text(hjust = 0.5),
+    legend.position = "none"
+    )
+
+heat_colors_interpolated <- colorRampPalette(
+  paletteer::paletteer_d("RColorBrewer::YlOrRd", n = 9, direction = -1)
+  )(10)
+
+p2 <- plot_court() +
+  geom_density_2d_filled(
+      data = shots,
+      aes(x = loc_x, y = loc_y, fill = ..level..),
+      contour_var = "ndensity", # normalize to each QBs total passes
+      breaks = seq(0.1, 1.0, length.out = 10), # drop the lowest passes
+      alpha = 0.8,
+      show.legend = FALSE
+    ) +
+  geom_label(aes(x = width/2, y = height - 2.5,
+                 label = "Kernel Density Estimation")) +
+  geom_text(aes(x = width/2, y = height - 3.5,
+                label = "Drop lowest densities")) +
+  scale_fill_manual(
+      values = c(heat_colors_interpolated),
+      aesthetics = c("fill", "color")
+      ) +
+  xlim(0, width) +
+  ylim(0, height)
+
+# plot 2 plots side-by-side
+grid.arrange(p1, p2, ncol=2, nrow =1)
+```
+
+Let's load a larger dataset before we start our density estimation.
+
+```{r, echo = TRUE}
+# Load the larger dataset
+shots_3000_tb <- readRDS(file = "data/shots_3000_tb.rds")
+
+# Load large spatial shots data
+shots_3000_sf <- readRDS(file = "data/shots_3000_sf.rds")
+```
+
+```{r more-shots, echo = FALSE, fig.cap = 'Yay! We have more shots.', out.width='100%', fig.align='center'}
+n_old <- nrow(shots_sf)
+n_new <- nrow(shots_3000_sf)
+
+p1 <- plot_court() +
+  geom_sf(data = shots_sf, aes(color = shot_made_factor),
+          alpha = 0.1, size = 1) +
+  # Red = Miss, Green = Make
+  scale_color_manual(values = c("red", "green")) +
+  # Remove legend title
+  theme(legend.title = element_blank()) +
+  geom_label(aes(x = width/2, y = height - 2.5,
+                 label = "Old Data Set")) +
+  geom_text(aes(x = width/2, y = height - 3.5,
+                label = paste(n_old, "Shots")))
+
+
+p2 <- plot_court() +
+  geom_sf(data = shots_3000_sf, aes(color = shot_made_factor),
+          alpha = 0.1, size = 1) +
+  # Red = Miss, Green = Make
+  scale_color_manual(values = c("red", "green")) +
+  # Remove legend title
+  theme(legend.title = element_blank()) +
+  geom_label(aes(x = width/2, y = height - 2.5,
+                 label = "New Data Set")) +
+  geom_text(aes(x = width/2, y = height - 3.5,
+                label = paste(n_new, "Shots")))
+
+# plot 2 plots side-by-side
+grid.arrange(p1, p2, ncol=2, nrow =1)
+```
+
+We now have `r n_new` shots instead of `r n_old` shots. Note from Figure \@ref(fig:more-shots) that the new shots have roughly the same spatial structure of the previous dataset. The main difference is that the mid-range has more observations in the larger dataset which will make our density estimation and interpolation more relevant.
+
+## 2D-Histograms & Spatial Binning
+
+The simplest way to estimate the local density of a point-pattern is to split up the court into a grid and count the number of shots within each cell. However, histograms tend to be highly sensitive to the subjective placement of the grid^[see this [article](https://en.wikipedia.org/wiki/Multivariate_kernel_density_estimation) and more specifically this [image](https://commons.wikimedia.org/wiki/File:Synthetic_data_2D_histograms.png#/media/File:Synthetic_data_2D_histograms.png)].
+
+```{r grid, fig.cap = 'Which grid is best?', out.width='100%', fig.align='center'}
+library(viridis)
+library(ggforce)
+
+p1 <- plot_court() +
+  stat_bin2d(data = shots_3000_tb, aes(x = loc_x, y = loc_y), bins=15, alpha = 0.9) +
+  geom_label(aes(x = width/2, y = height - 2.5,
+                 label = "Rectangular Grid")) +
+  scale_fill_viridis() +
+  geom_circle(aes(x0 = 14.1, y0 = 2, r = 0.9),
+              color = "red", alpha = 0.8, inherit.aes = FALSE)
+
+p2 <- plot_court() +
+  geom_hex(data = shots_3000_tb, aes(x = loc_x, y = loc_y), 
+           bins = 15, alpha = 0.9) +
+  geom_label(aes(x = width/2, y = height - 2.5,
+                 label = "Hexagonal Grid")) +
+  scale_fill_viridis() +
+  geom_circle(aes(x0 = 14.1, y0 = 2, r = 0.9),
+              color = "red", alpha = 0.8, inherit.aes = FALSE)
+
+# plot 2 plots side-yby-side
+grid.arrange(p1, p2, ncol=2, nrow =1)
+```
+
+The cell size and location can lead to misleading results given the nature of basketball data. The rectangular cells that contain the three-point line are at a greater risk of misleading the reader. As you can see from Figure \@ref(fig:grid-zoom) below, some cells indicate a high density of shots inside the three-point line although there are little to no shots in this area. The vast majority of shots reside within one foot outside of the three-point line.
+
+```{r grid-zoom, echo = FALSE, fig.cap = 'Close up look at the left corner-three area', out.width='100%', fig.align='center'}
+plot_court() +
+  stat_bin2d(data = shots_3000_tb, aes(x = loc_x, y = loc_y),
+             bins=15, alpha = 0.9) +
+  scale_fill_viridis() +
+  geom_circle(aes(x0 = 14.1, y0 = 2, r = 0.9),
+              color = "red", alpha = 0.8, inherit.aes = FALSE) +
+  geom_sf(data = shots_3000_sf, alpha = 0.3) +
+  coord_sf(xlim = c(11, 15), ylim = c(0.5, 4)) +
+  theme(legend.position = "none")
+```
+
+## Kernel Density Estimation
+
+### How It Works (ish) - 1D
+
+The traditional way to get around this issue is to __stop counting__. The goal of this chapter is to move away from discrete values offered by clustering and spatial binning. Instead, we want to display the density of shots as a continuous quantity.
+
+We can use [__Kernel Density Estimation (KDE)__](https://en.wikipedia.org/wiki/Kernel_density_estimation) to achieve this. A kernel is a continuous function that is centered at each point in our data. The widget below^[Figure \@ref(fig:kernel-shiny)] comes from Eduardo García Portugués's notes that can be found [here](https://bookdown.org/egarpor/NP-UC3M/kde-i-kde.html). It shows how the kernels are centered at the 10 randomly generated data points by default.The black curve is obtained by __adding the heights of the kernels at a specific $x$ value__. 
+
+```{r kernel-shiny, fig.cap = 'Thank you Eduardo for this [application](https://bookdown.org/egarpor/NP-UC3M/kde-i-kde.html)!', out.width='100%', fig.align='center'}
+# https://bookdown.org/egarpor/NP-UC3M/kde-i-kde.html
+knitr::include_app("https://shinyserv.es/shiny/kde/",
+  height = "1000px")
+```
+
+As the number of observations in the sample increase, the choice of kernel will have less of an impact than the choice of the bandwidth parameter. You can test the previous statements by generating 200 observations from the widget above and testing different combinations of bandwidths and kernels. Also note that the height of each kernel is divided by number of observations. Try generating just __1 observation__ with a __bandwidth value near 1__.
+
+Next, we can apply the concept of KDE to our data. Let's try to estimate the density of the distances from the center of the hoop. We know that most shots in our shot locations data set take place near the rim and around the three-point line.
+
+```{r, fig.show='hide'}
+# bin width
+w <- 0.2
+
+hist <- hist(
+  x = shots_3000_tb$dist_meters,
+  breaks = seq(0 , 11, by = w),
+  freq = FALSE)
+
+# sum(diff(hist$breaks) * hist$density)
+hist_tb <- tibble(
+  bin_mid = hist$mids,
+  bin_width = w,
+  count = hist$counts,
+  density = hist$density,
+  bin_area = bin_width * density
+)
+
+estimated_3pt_prop <- hist_tb %>%
+  filter(bin_mid >=  three_point_radius) %>%
+  summarise(
+    estimated_3pt_prop = sum(bin_width * density)
+  )
+
+actual_3pt_prop <- shots_3000_tb %>%
+  filter(dist_meters >=  three_point_radius) %>%
+  summarise(
+    actual_3pt_prop = n() / nrow(shots_3000_tb)
+  )
+```
+
+```{r hist-density, fig.cap = 'One-dimensional density plot for shot distance', out.width='100%', fig.align='center'}
+ggplot(data = shots_3000_tb, aes(x = dist_meters)) +
+  geom_histogram(aes(y = ..density..),
+                 binwidth = 0.2, fill = "grey", color = "black") +
+  geom_density() +
+  geom_vline(xintercept = three_point_radius,
+             linetype = "dashed") +
+  xlim(0, NA) +
+  theme_classic() +
+  labs(
+    x = "Distance from the hoop (meters)",
+    y = "Density"
+  )
+```
+
+As expected, the greatest densities occur in the first 2 meters and past the the dashed line which represents the radius of the arc of the three-point line^[The arc radius is `r three_point_radius` meters. Refer to Chapter \@ref(court) to review the dimensions of a FIBA regulation size basketball court.].
+
+> __But how can we interpret the numbers of the y-axis of a density plot?__
+
+The key is to understand the difference between __probability__ and __probability density__. 
+
+__Probability__ ranges between zero and one. It describes how likely an event is to occur. In Figure \@ref(fig:hist-density), the event of interest is whether a randomly selected shot from our sample is likely to take place at a specific distance from the hoop.
+
+__Probability Density__ is __not__ limited to values between zero and one. The numbers in the y-axis are the probability per unit length on the x-axis. 
+
+The y-axis of Figure \@ref(fig:hist-density) represents the __probability density__ function ([pdf](https://en.wikipedia.org/wiki/Probability_density_function)) for the kernel density estimation^[This [article](https://towardsdatascience.com/histograms-and-density-plots-in-python-f6bda88f5ac0) does a decent job explaining the fundamentals.]. To convert the density values of the histogram into probabilities, we simply need to find the __area__ of each bin. The area of a rectangle is given by $A_{\mbox{rectangle}} = \mbox{base} \times \mbox{height}$. Thus, the area of a particular bin is obtained by multiplying the bin width of `r w` meters by the density value (height) of the bin.
+
+```{r}
+# sum(diff(hist$breaks) * hist$density)
+# hist_tb <- tibble(
+#   bin_mid = hist$mids,
+#   bin_width = w,
+#   count = hist$counts,
+#   density = hist$density,
+#   bin_area = bin_width * density
+# )
+```
+
+```{r density-hist, fig.cap = 'How to convert from density to probability given a histogram'}
+knitr::kable(
+  hist_tb,
+  digits = 3,
+  caption = 'How to convert from density to probability given a histogram',
+  booktabs = TRUE
+) %>%
+  scroll_box(width = "100%", height = "400px")
+```
+
+Table \@ref(tab:density-hist) above displays the area of each bin. Note that adding the areas of all `r nrow(hist_tb)` bins adds up to __one__. This is because probability density functions (PDFs) need to __add to one if discrete (histogram)__ or __integrate to one if continuous (density curve)__.
+
+It is often easier to work with and conceptualize discrete distributions like the histogram. However, working with the continuous estimated density curve from Figure \@ref(fig:hist-density) can be more useful. We need [integrals](https://en.wikipedia.org/wiki/Integral) to calculate the area under a continuous function. Since the curve is the __probability density function__, we know that the area under the curve must equal to __one__. 
+
+> __What is the probability of a shot occurring past the three-point line in our sample?__
+
+To answer the question above using the __histogram__, we can simply add the areas of the bins with a mid-point greater than `r three_point_radius` meters. We get that the total area of the `r nrow(hist_tb%>%filter(bin_mid >=  three_point_radius))` bins past the three-point line is `r round(estimated_3pt_prop*100, digits = 2)`. Thus, we estimated using histograms that there was roughly `r round(estimated_3pt_prop*100, digits = 2)`% of the shots to took place further than `r three_point_radius` meters from the hoop. In fact, we know that `r round(actual_3pt_prop*100, digits = 2)`%^[`r nrow(shots_3000_tb %>%filter(dist_meters >=  three_point_radius))` / `r nrow(shots_3000_tb )` = `r actual_3pt_prop`] of the shots were released past the specified distance. 
+
+We can also use the __continuous density curve__ to try to answer the same question. The probability of a shot occurring past the three-point line is given by the area under the curve of the "bump" at the dashed line. We could use the integral below to get the exact area under the curve.
+
+$$
+\mbox{AUC}_{\mbox{three-point range}} = \int_{6.75}^{\infty} f(x) dx
+$$
+
+The problem is that we do not know equation for $f(x)$^[the probability density function or PDF for short]. We can estimate the area under the curve for the specific region with the red triangle in Figure \@ref(fig:tri-density) below.
+
+```{r}
+tri_min <- 6
+tri_max <- 8.5
+tri_base <- tri_max - tri_min
+tri_height <- max(density(shots_3000_tb$dist_meters)$y)
+
+# tri_area <- (base * height) / 2
+
+triangle <- tibble(
+  x = c(
+    tri_min,
+    7,
+    tri_max,
+    tri_min
+  ),
+
+  y = c(
+    0,
+    tri_height,
+    0,
+    0
+  )
+)
+```
+
+```{r tri-density, fig.cap = 'Estimating the area under the curve of a density plot', out.width='100%', fig.align='center'}
+ggplot(data = shots_3000_tb, aes(x = dist_meters)) +
+  geom_histogram(aes(y = ..density..),
+                 binwidth = 0.2, fill = "grey", color = "black") +
+  geom_polygon(data = triangle, aes (x, y), alpha = 0.2, fill = "red") +
+  geom_density() +
+  geom_vline(xintercept = three_point_radius,
+             linetype = "dashed") +
+  xlim(0, NA) +
+  theme_classic() +
+  labs(
+    x = "Distance from the hoop (meters)",
+    y = "Density"
+  )
+```
+
+$$
+A_{\mbox{triangle}} = \frac{\mbox{base} \times \mbox{height}}{2} = \frac{`r tri_base` \times `r tri_height`}{2} = `r round((tri_base * tri_height)/2, digits = 2)`
+$$
+
+```{r}
+# https://stackoverflow.com/questions/40851328/compute-area-under-density-estimation-curve-i-e-probability
+x <- shots_3000_tb$dist_meters
+d <- density(x, from = 0)
+xx <- d$x  ## 512 evenly spaced points on [min(x) - 3 * d$bw, max(x) + 3 * d$bw]
+dx <- xx[2L] - xx[1L]  ## spacing / bin size
+yy <- d$y  ## 512 density values for `xx`
+
+f <- approxfun(xx, yy)
+zero_to_three_meters <- integrate(f, 0, 3)$value
+three_to_six_meters <- integrate(f, 3, 6)$value
+six_to_twelve_meters <- integrate(f, 6, 12)$value
+```
+
+The area of the triangle gives us the rough probability that a randomly selected shot in our sample occurred further than `r three_point_radius` meters from the hoop. It is important to realize that this method is not exact and was used only for demonstration purposes. [Fancier methods](https://stackoverflow.com/questions/40851328/compute-area-under-density-estimation-curve-i-e-probability) could be used to better estimate the area under the curve of a density curve. Using interpolation to estimate $f(x)$, we can use integration to get that the probability of a randomly selected shot in our sample is less than 3 meters away from the hoop to be `r round(zero_to_three_meters, digits = 2)`, between 3 and 6 meters away is `r round(three_to_six_meters, digits = 2)`, and 6 meters or more to be `r round(six_to_twelve_meters, digits = 2)`. Adding these probabilities results in a number relatively close to one which makes sense since the total area under the curve should be 1.
+
+Note that the "density bump" extends on the left of the dashed line for values less than `r three_point_radius` meters. This is because the default kernels are wide and leak over the dashed line even though the shots are are on the right. There are many techniques used to account for this "leakage" problem^[You can search "Boundary Correction for Kernel Density Estimation" to learn more.]. For our purpose we could simply adjust the banwidth to be half of its default value.
+
+```{r adjust-density, fig.cap = 'Smaller bandwidth to limit the leakage issue.', out.width='100%', fig.align='center'}
+ggplot(data = shots_3000_tb, aes(x = dist_meters)) +
+  geom_histogram(aes(y = ..density..),
+                 binwidth = 0.2, fill = "grey", color = "black") +
+  geom_density(adjust = 0.5) +
+  geom_vline(xintercept = three_point_radius,
+             linetype = "dashed") +
+  xlim(0, NA) +
+  theme_classic() +
+  labs(
+    x = "Distance from the hoop (meters)",
+    y = "Density"
+  )
+```
+
+The three-point line "density bump" of Figure \@ref(fig:adjust-density) has less of its area on the left of the dashed line than the bump of Figure \@ref(fig:tri-density). The `adjust` parameter of the `geom_density()` function was set to `0.5` to narrow the bandwidths of the kernels by half of their default values. This results in a better fit between the density curves and the density histogram.
+
+Now that we understand how the one-dimensional Kernel Density Estimation works (ish), we can apply the technique on the basketball shot locations in our sample. Note that the density plots that follow were influenced by this [post](https://themockup.blog/posts/2020-08-28-heatmaps-in-ggplot2/) of the Mockup Blog.^[Mock (2020, Aug. 28). The Mockup Blog: Heatmaps in ggplot2. Retrieved from https://themockup.blog/posts/2020-08-28-heatmaps-in-ggplot2/]
+
+We can create a __rug plot__ using the `ggExtra` package to plot the  estimated marginal density distributions of our $(x, ~y)$ coordinates.
+
+```{r rug, fig.cap = 'Looking under the rug.', out.width='100%', fig.align='center'}
+p <- plot_court() +
+  geom_point(
+    data = shots_3000_tb, 
+    aes(x = loc_x, y = loc_y, color = shot_made_factor),
+    alpha = 0.1, size = 1) +
+  # Red = Miss, Green = Make
+  scale_color_manual(values = c("red", "green")) +
+  # Remove legend title
+  theme(legend.title = element_blank()) +
+  guides(colour = guide_legend(override.aes = list(alpha = 1)))
+
+
+ggMarginal(p, type = "density", groupColour = TRUE, groupFill = TRUE)
+```
+
+Figure \@ref(fig:rug) contains a ton a valuable information. Let's start by looking at the marginal distribution of the $x$ component located at the top of the graph. We see that most occur at the __center__ of the court. We also see that more shots take place from the left side (from the shooter's perspective) than the right side of the court . Based on the scatter plot, it looks like more shots come from the left corner-three rather than the right corner-three.
+
+The marginal distributions located on the right of the plot tell us that the vast majority of shots have $y$ component in the range of 1-3 meters. This makes sense given the number of shots coming from the restricted area and from the corners. The other bump in density occurs near the top of the three-point line. Again, this makes sense given what we know from the obvious clustering in the data.
+
+### How It Works (ish) - 2D
+
+Kernel Density Estimation can also used to estimate the density of data set with __two dimensions__. This is perfect for trying to figure out where the basketball shots are likely to occur given a bunch of $(x, ~y)$ coordinates.
+
+```{r}
+# Define a point sfg object for the center of the hoop
+hoop_center <- st_point(c(width/2, hoop_center_y))
+
+# Create a circle with radius 9 and crop it to fit within the court
+window_points <- st_crop(
+  st_sfc(st_buffer(hoop_center, dist = 7.75)),
+  xmin = 0, ymin = backboard_offset - backboard_thick,
+  xmax = width, ymax = height
+)
+
+# Create a polygon sf object with the coordinates
+window_points <- st_polygon(list(
+  st_coordinates(window_points)[ , 1:2]
+  ))
+
+# Define a window based on where the shots tend to take place
+window <- as.owin(window_points)
+
+# Create a ppp object
+shots_ppp_n <- ppp(
+  x = 7.5,
+  y = 5,
+  window = window)
+
+den <- density(shots_ppp_n)
+
+z <- den$v
+```
+
+```{r bell, echo = FALSE, fig.cap = 'Ding Don! It looks like a bell.', out.width='100%', fig.align='center'}
+# z is a numeric matrix
+density_matrix <- z
+fig <- plot_ly(z = ~density_matrix)
+fig <- fig %>% add_surface() 
+
+fig <- fig %>% layout(
+  scene = list(
+    camera=list(
+      eye = list(x=2, y=2, z=0.5)
+    )
+  )
+)
+
+fig
+```
+
+
+
+```{r, eval = FALSE}
+# Create a tibble with the (x, y) coordinates
+xy_tb <- tibble(x = shots_3000_tb$loc_x, y = shots_3000_tb$loc_y)
+
+# Calculate the default bandwidths
+def_bandwidths <- c(MASS::bandwidth.nrd(xy_tb$x), MASS::bandwidth.nrd(xy_tb$y))
+
+# Calculate the Kernel Density
+# Splits the range of the shots into a 25x25 grid by default
+density <- MASS::kde2d(
+  x = xy_tb$x, y = xy_tb$y, h = def_bandwidths
+)
+
+density <- MASS::kde2d(
+  x = c(6, 9),
+  y = c(4, 5),
+  h = 2
+)
+
+# Convert the kde2d ouput into a tibble
+xyz_tb <- tibble(
+  expand.grid(x = density$x, y = density$y),
+  z = as.vector(density$z)
+  )
+
+# Convert the densities back to a matrix
+z <- tapply(xyz_tb$z, xyz_tb[c("x", "y")], identity)
+
+z <- den$v
+
+
+# https://plotly.com/r/3d-surface-plots/
+# 3D
+library(plotly)
+# z is a numeric matrix that ships with R
+
+density_matrix <- z
+fig <- plot_ly(z = ~density_matrix)
+fig <- fig %>% add_surface()
+
+fig
+```
+
+The default kernel when working in two dimensions will be a [Bivariate Normal Distribution](https://www.statisticshowto.com/bivariate-normal-distribution/). Figure \@ref(fig:bell) shows a 3D bell curve centered at the point $(7.5, ~ 5)$. The density can also be visualized in 2D using a contour plot or a heatmap.
+
+```{r ink-drop, echo = FALSE, fig.cap = 'One drop of ink located at (7.5,5)', out.width='100%', fig.align='center'}
+plot(den, main = "Kernel Density for 1 Shot", sub = "(7.5,5)")
+contour(den, add = TRUE)
+```
+
+You can think of Figure \@ref(fig:ink-drop) (and kernel density estimation in general) as a drop of yellow ink on a blue sheet of paper. The highest density is found at the location of the shot and the density decays as you move radially outwards at a rate that depends on the kernel and parameters of choice. 
+
+```{r ink-drops, echo = FALSE, fig.cap = 'Two drops of ink located at (6,4) & (9, 4)', out.width='100%', fig.align='center'}
+# Create a ppp object
+shots_ppp_n <- ppp(
+  x = c(6, 9),
+  y = c(4, 4),
+  window = window)
+
+den <- density(shots_ppp_n)
+
+plot(den, main = "Kernel Density for 2 Shots", sub = "(6,4) & (9, 4)")
+contour(den, add = TRUE)
+```
+
+This idea can be extended to multiple points as seen in Figure \@ref(fig:ink-drops). The yellow ink of each points combine in the middle. You can think of it as the height of each kernel combining to make a mega mountain with peaks at the locations with the most shots as seen in Figure \@ref(fig:bells) below.
+
+```{r bells, echo = FALSE, fig.cap = 'Ding Dong', out.width='100%', fig.align='center'}
+density_matrix <- den$v
+fig <- plot_ly(z = ~density_matrix)
+fig <- fig %>% add_surface() 
+
+fig <- fig %>% layout(
+  scene = list(
+    camera=list(
+      eye = list(x=2, y=2, z=0.5)
+    )
+  )
+)
+
+fig
+```
+
+Now that we know the basics of [2D KDE](https://en.wikipedia.org/wiki/Multivariate_kernel_density_estimation), let's use the [`geom_density_2d_filled()`](https://ggplot2.tidyverse.org/reference/geom_density_2d.html) function from the `ggplot2` package to create our heatmaps^[Heatmaps and 2D-density plots are used interchangeably in this chapter.]. By default, this function uses a Gaussian kernel (3D bell curve). The bandwidths^[the parameters that determine the shape of our 3D bell curve] are determined using the [`bandwidth.nrd(x)`](https://www.rdocumentation.org/packages/MASS/versions/7.3-54/topics/bandwidth.nrd) function from the `MASS` package.
+
+```{r, echo = TRUE}
+# Load the MASS library
+library(MASS)
+
+# Default Bandwidths
+h_x <- bandwidth.nrd(shots_3000_tb$loc_x)
+h_y <- bandwidth.nrd(shots_3000_tb$loc_y)
+```
+
+In our case, the default bandwidth in the $x$-direction is `r round(h_x, digits = 2)` and the default bandwidth in the $y$-direction is `r round(h_y, digits = 2)`. Figure \@ref(fig:ggdensity-default) below uses these default bandwidths to create a regular density contour plot. 
+
+```{r ggdensity-default, echo = FALSE, fig.cap = 'Default kernel density plot obtained with ggplot and the MASS package', out.width='100%', fig.align='center'}
+# The density estimate
+plot_court() +
+  geom_point(data = shots_3000_tb, aes(x = loc_x, y = loc_y),
+             size = 0.5, alpha = 0.05) +
+  geom_density_2d_filled(
+      data = shots_3000_tb,
+      aes(x = loc_x, y = loc_y, fill = ..level..),
+      # Regular density
+      contour_var = "density",
+      # These are the default bandwidth values
+      # h = c(bandwidth.nrd(shots_3000_tb$loc_x),
+      #       bandwidth.nrd(shots_3000_tb$loc_y)),
+      alpha = 0.8,
+      show.legend = TRUE
+    ) +
+  # Add contour lines
+  geom_density_2d(
+    data = shots_3000_tb, aes(x = loc_x, y = loc_y),
+    size = 0.25, colour = "black") +
+  geom_label(aes(x = width/2, y = height - 2.5,
+                 label = "Kernel Density Estimation")) +
+  geom_text(aes(x = width/2, y = height - 3.5,
+                label = "Default Bandwidths")) +
+  # Rename legend and place Legend on the right
+  labs(
+    fill = "Density"
+  ) +
+  lims(x= c(0, width), y = c(0, height)) +
+  theme(
+    legend.position = "right",
+    legend.title.align = 0.5
+  )
+```
+
+We see that the default values for the bandwidth `h` do a pretty good job. The same 5 spots discovered through clustering in the previous chapter are evident in Figure \@ref(fig:ggdensity-default). The highest density is found near the rim which is consistent with previous observations. 
+
+> __But how can we interpret the numbers in the legend?__
+
+```{r}
+# Create a tibble with the (x, y) coordinates
+xy_tb <- rbind(
+  tibble(x = shots_3000_tb$loc_x, y = shots_3000_tb$loc_y),
+  c(0,0),
+  c(0, height),
+  c(width, height),
+  c(width, 0)
+  )
+
+# Calculate the default bandwidths
+def_bandwidths <- c(MASS::bandwidth.nrd(xy_tb$x), MASS::bandwidth.nrd(xy_tb$y))
+
+# Calculate the Kernel Density
+# Splits the range of the shots into a 25x25 grid by default
+density <- MASS::kde2d(
+  x = xy_tb$x, y = xy_tb$y, h = def_bandwidths, n = 100
+)
+
+# Convert the kde2d ouput into a tibble
+xyz_tb <- tibble(
+  expand.grid(x = density$x, y = density$y),
+  z = as.vector(density$z)
+  )
+
+# Convert the densities back to a matrix
+z <- tapply(xyz_tb$z, xyz_tb[c("x", "y")], identity)
+
+
+# Calculate some nice breaks for the legend scale
+breaks <- pretty(range(xyz_tb$z), n = 10)
+
+# Calculate Contour Lines
+contour_lines <- grDevices::contourLines(
+  x = density$x, y = density$y, z = density$z,
+  levels = breaks
+)
+
+contour_lines_sp <- SpatialPolygons(
+  lapply(1:length(contour_lines), function(idx) {
+    Polygons(
+      srl = list(Polygon(
+        matrix(
+          c(contour_lines[[idx]]$x, contour_lines[[idx]]$y),
+          nrow=length(contour_lines[[idx]]$x), byrow=FALSE
+          )
+      )),
+      ID = idx
+    )
+  }
+  )
+)
+
+cl_sfc <- st_as_sf(contour_lines_sp)
+
+cl_sf <- cl_sfc %>% 
+  mutate(
+    density_level = sapply(contour_lines, function(object) object$level),
+    contour_area = st_area(cl_sfc)
+  ) %>%
+  relocate(geometry, .after = last_col())
+
+# # Fix contour in left-corner 3
+# min_dens_lvl <- min(cl_sf$density_level)
+# 
+# broken_xy <- cl_sf[[3]][[5]][[1]]
+# 
+# fixed_xy <- as.matrix(
+#   rbind(
+#   head(broken_xy, n = 9),
+#   c(st_bbox(shots_3000_sf)$xmax, st_bbox(shots_3000_sf)$ymin),
+#   tail(broken_xy, n = 1)
+# )
+# )
+# 
+# colnames(fixed_xy)<-NULL
+# rownames(fixed_xy)<-NULL
+# 
+# cl_sf[[3]][[5]][[1]] <- fixed_xy
+
+shots_cl_sf <- st_join(shots_3000_sf, cl_sf) %>%
+  mutate(
+    density_lower = ifelse(is.na(density_level), 0, density_level),
+    density_upper = density_lower + diff(breaks)[1]
+    # density_upper = case_when(
+    #   density_lower < max(density_lower) ~ density_lower + diff(breaks)[1],
+    #   density_lower >= max(density_lower) ~ 1000
+    # ),
+    # density_upper = ifelse(density_upper == 1000, NA, density_upper)
+    ) %>%
+  relocate(geometry, .after = last_col())
+
+contour_lines_sf <- shots_cl_sf %>%
+  group_by(density_lower, density_upper) %>%
+  count()
+
+shots_cl_sf_2 <- st_join(cl_sf, shots_3000_sf) %>%
+  mutate(
+    density_lower = ifelse(is.na(density_level), 0, density_level),
+    density_upper = density_lower + diff(breaks)[1]
+    # density_upper = case_when(
+    #   density_lower < max(density_lower) ~ density_lower + diff(breaks)[1],
+    #   density_lower >= max(density_lower) ~ 1000
+    # ),
+    # density_upper = ifelse(density_upper == 1000, NA, density_upper)
+  ) %>%
+  relocate(geometry, .after = last_col())
+
+contour_lines_sf_2 <- shots_cl_sf_2 %>%
+  group_by(density_lower, density_upper) %>%
+  count()
+
+first_row <- contour_lines_sf[1, ]
+
+first_row$n <- nrow(shots_3000_sf)
+
+st_geometry(first_row) <- st_as_sfc(st_bbox(half_court))
+
+contour_shots <- rbind(
+  first_row,
+  contour_lines_sf_2
+)
+
+contour_stats <- contour_shots %>%
+  transmute(
+    density_lower,
+    density_upper,
+    # Units = meters^2
+    contour_area = st_area(geometry),
+    total_area = st_area(half_court),
+    area_frac = contour_area / total_area,
+    contour_shots = n, 
+    total_shots = nrow(shots_3000_sf),
+    shots_frac = contour_shots / total_shots,
+    contour_intensity = contour_shots / contour_area
+  ) %>%
+  arrange(density_lower)
+
+cl_stats <- contour_stats %>%
+  mutate(
+    distinct_contour_shots = contour_shots - lead(contour_shots, default = 0),
+    distinct_contour_shots_frac = distinct_contour_shots / total_shots,
+    distinct_contour_area = contour_area - lead(contour_area, default = 0),
+    distinct_contour_area_frac = distinct_contour_area / total_area,
+    distinct_contour_density = distinct_contour_shots / distinct_contour_area,
+    density_mid = case_when(
+      is.na(density_upper) ~ density_lower,
+      TRUE ~ (density_lower + density_upper) / 2
+    ),
+    distinct_contour_prob = density_mid * distinct_contour_area
+  ) %>%
+  relocate(geometry, .after = last_col())
+
+# sum(cl_stats$distinct_contour_prob)
+```
+
+The numbers on the right of Figure \@ref(fig:ggdensity-default) represent the probability density function ([pdf](https://en.wikipedia.org/wiki/Probability_density_function)) for the kernel density estimation^[This [article](https://towardsdatascience.com/histograms-and-density-plots-in-python-f6bda88f5ac0) does a decent job explaining the fundamentals.]. They are the __probability per unit area__ (squared meters in our case) of a randomly selected shot from our sample to be located in the regions coloured by the particular [contour level](https://en.wikipedia.org/wiki/Contour_line). 
+
+With some ingenuity, these statistics can be obtained^[Some of the code from this stack overflow [article](https://stackoverflow.com/questions/53172200/stat-density2d-what-does-the-legend-mean) was adapted to our purposes.]. The coordinates of the contour lines can be computed manually and converted to `sf` objects. We can then calculate the areas of the polygons formed by the contour lines. The distinct contour areas are obtained by subtracting the areas of the contours one level above them. The nice thing about working with spatial objects is that we can use the `st_join()` function to determine which shots fall within each contour. The results are displayed in Table \@ref(tab:contour-stats) below.
+
+```{r contour-stats, fig.cap = 'Contour stats'}
+knitr::kable(
+  cl_stats %>% relocate(density_mid, distinct_contour_area, distinct_contour_prob, distinct_contour_shots) %>% st_drop_geometry(),
+  digits = 4,
+  caption = "Contour stats",
+  booktabs = TRUE
+) %>%
+  scroll_box(width = "100%", height = "625px")
+```
+
+> __What is the probability of a shot falling in a contour?__
+
+Now that we are working in two dimensions, we __can't__ simply find the area under the density curve as we did in the one-dimensional case of Figure \@ref(fig:tri-density). Instead, we need to calculate the volume under the 3D surface of the court shown in Figure \@ref(fig:plotly-density). The $x$ and $y$ axes denote the grid cell identification number used for the kernel density estimation. The height denoted by $z$ indicates the density for the specified cell. Note that the graph seems to be __mirrored about the $y$-axis__. In other words, the peak of the right corner-three should really be positioned in the left corner-three.
+
+```{r plotly-density, echo = FALSE, fig.cap = 'The mountain range of basketball', out.width='100%', fig.align='center'}
+# z is a numeric matrix of densities
+fig <- plot_ly(z = ~z) %>% add_surface(
+  contours = list(
+    z = list(
+      show=TRUE,
+      usecolormap=TRUE,
+      highlightcolor="#ff0000",
+      project=list(z=TRUE)
+    )
+  )
+)
+fig <- fig %>% layout(
+  scene = list(
+    camera=list(
+      eye = list(x=1.87, y=-0.88, z=0.64)
+    )
+  )
+)
+
+fig
+```
+
+That said, the `distinct_contour_prob` column of Table \@ref(tab:contour-stats) is the volume under the distinct contour levels. For example, the largest contour level with density between `r cl_stats$density_lower[1]` and `r cl_stats$density_upper[1]` has an area of `r round(cl_stats$distinct_contour_area[1], digits = 2)` squared meters. This makes sense given that the area of the entire half-court is $`r width`\mbox{m} \times `r height`\mbox{m} = `r width*height` \mbox{m}^2$. Now, the volume under the dark purple area depends on the average height of this region. If we take the mid-point of `r cl_stats$density_lower[1]` and `r cl_stats$density_upper[1]` we get a height of `r cl_stats$density_mid[1]`. This results in a volume under the contour of approximately 
+
+```{r}
+contour_area <- cl_stats$distinct_contour_area[1]
+contour_height <- cl_stats$density_mid[1]
+contour_prob <- contour_area * contour_height
+```
+
+
+$$
+V = A_{\mbox{contour}} \times h_{\mbox{contour}} = `r round(contour_area)` \times `r round(contour_height, digits = 4)` = `r round(contour_prob, digits = 2)` \mbox{m}^3.
+$$
+
+This means that we can expect based on this approximation that `r round(contour_prob*100, digits = 2)`% of randomly selected shots from our sample to come from this area. In reality, there is only `r cl_stats$distinct_contour_shots[1]` shots in this massive area. This represents only `r round(cl_stats$distinct_contour_shots_frac[1]*100, digits = 2)`% of the `r nrow(shots_3000_tb)` shots in the sample. This suggests that the average height of this region is most likely closer to zero than `r cl_stats$density_upper[1]`.
+
+Of course, this mid-point method is flawed. We would need to use integrals to precisely estimate the volume under each contour line. Let's consider the highest contour with density between `r max(cl_stats$density_lower)` and `r max(cl_stats$density_upper)` and an area of `r round(min(cl_stats$distinct_contour_area), digits = 2)` squared meters. This represents where many of the right layups occur. There are still `r cl_stats$distinct_contour_shots[13]` shots in this tiny area. This explains why the density is so high at this area. Now, the volume under this bright-yellow near circular region is essentially a cylinder of height `r max(cl_stats$density_mid)`. This time the volume is $V = A_{\mbox{contour}} \times h_{\mbox{contour}} = `r round(min(cl_stats$distinct_contour_area), digits = 2)` \times `r max(cl_stats$density_mid)` = `r round(cl_stats$distinct_contour_prob[13], digits = 2)` \mbox{m}^3$. 
+
+This means that we can expect roughly `r round(cl_stats$distinct_contour_prob[13]*100, digits = 2)`% of shots to come from this area. This time, there is really `r cl_stats$distinct_contour_shots[13]` shots which represents `r round(cl_stats$distinct_contour_shots_frac[13]*100, digits = 2)`% of the `r nrow(shots_3000_tb)` shots in the sample. We see that the mid-point technique underestimated the actual number of shots in this region. 
+
+```{r}
+# # Calculate the Kernel Density
+# # Splits the range of the shots into a 25x25 grid by default
+# density <- MASS::kde2d(
+#   x = xy_tb$x, y = xy_tb$y, h = def_bandwidths, n = 100
+# )
+# 
+# grid <- st_make_grid(half_court, n = 100)
+# 
+# grid_centroids <- st_centroid(grid)
+# 
+# centroids_z <- tibble(
+#   x = st_coordinates(grid_centroids)[ , 1],
+#   y = st_coordinates(grid_centroids)[ , 2],
+#   cell_density = as.vector(density$z), 
+#   cell_area = st_area(grid),
+#   cell_prob = cell_area * cell_density
+#   )
+# sum(centroids_z$cell_prob)
+# 
+# plot_court() +
+#   geom_point(data = centroids_z, aes(x, y, size = z), alpha = 0.2)
+```
+
+
+## Basketball Density Plots in R
+
+The blobs are fairly large and spill over the three-point line. We've learn from Figure \@ref(fig:grid-zoom) that there very little shots that are released in the first feet inside the three-point line. As a result, we can set the `adjust` argument of the `geom_density_2d_filled()` function to `0.5` to half the default bandwidths. Thus, Figure \@ref(fig:ggdensity-half) below use bandwidths of `r round(h_x / 2, digits = 2)` and `r round(h_y / 2, digits = 2)` in and the $x$ and $y$ directions respectively. Feel free to refer to Figure \@ref(fig:kernel-shiny) to recall the effects of changing the bandwidth on the density estimation.
+
+```{r ggdensity-half, fig.cap = 'Smaller blobs with higher densities', out.width='100%', fig.align='center'}
+# The density estimate
+plot_court() +
+  geom_point(data = shots_3000_tb, aes(x = loc_x, y = loc_y),
+             size = 0.5, alpha = 0.05) +
+  geom_density_2d_filled(
+      data = shots_3000_tb,
+      aes(x = loc_x, y = loc_y, fill = ..level..),
+      contour_var = "density",
+      # use half of the default bandwidth
+      adjust = 0.5,
+      alpha = 0.8,
+      show.legend = TRUE
+    ) +
+  geom_label(aes(x = width/2, y = height - 2.5,
+                 label = "Kernel Density Estimation")) +
+  geom_text(aes(x = width/2, y = height - 3.5,
+                label = "Half of Default Bandwidths")) +
+  labs(
+    fill = "Density"
+  ) +
+  lims(x= c(0, width), y = c(0, height)) +
+  theme(
+    legend.position = "right",
+    legend.title.align = 0.5
+  )
+```
+
+Figure \@ref(fig:ggdensity-half) above does a much cleaner job of representing the popular spots to shoot from. The smaller bandwidths limit the spillage and lead to blobs with higher densities than the previous plot.
+
+We can build on the ideas and design from the previous density plots and __normalize__ the densities so the values are __between zero and one__. That way, we can easily drop the smaller normalized densities values (between 0 and 0.1) by manipulating the `breaks` argument.
+
+```{r ndensity, fig.cap = 'Dropping the lowest normalized densities', out.width='100%', fig.align='center'}
+# Density estimate, scaled to a maximum of 1.
+plot_court() +
+  geom_point(data = shots_3000_tb, aes(x = loc_x, y = loc_y),
+             size = 0.5, alpha = 0.05) +
+  geom_density_2d_filled(
+      data = shots_3000_tb,
+      aes(x = loc_x, y = loc_y, fill = ..level..),
+      contour_var = "ndensity", # normalize density
+      breaks = seq(0.1, 1.0, by = 0.1), # drop the lowest 
+      adjust = 0.5,
+      alpha = 0.8,
+      show.legend = TRUE
+    ) +
+  geom_label(aes(x = width/2, y = height - 2.5,
+                 label = "Normalized Kernel Density Estimation")) +
+  geom_text(aes(x = width/2, y = height - 3.5,
+                label = "Half of Default Bandwidths")) +
+    labs(
+    fill = "Normalized \n Density"
+  ) +
+  lims(x= c(0, width), y = c(0, height)) +
+  theme(
+    legend.position = "right",
+    legend.title.align = 0.5
+  )
+```
+
+The legend of this normalized density plot (Figure \@ref(fig:ndensity)) is even more difficult to interpret than the legend for a regular density plot such as Figure \@ref(fig:ggdensity-half). For our purposes, the main advantage of normalizing a density plot is so we can easily drop the lowest or highest density values. For this reason, we will omit the legend since we are only interested in where shots are likely to take place relative to other locations.
+
+```{r count-kde, fig.cap = 'Estimated Counts', out.width='100%', fig.align='center', eval = FALSE}
+# Density estimate * number of observations in group.
+plot_court() +
+  geom_point(data = shots_3000_tb, aes(x = loc_x, y = loc_y),
+             size = 0.5, alpha = 0.05) +
+  geom_density_2d_filled(
+      data = shots_3000_tb,
+      aes(x = loc_x, y = loc_y, fill = ..level..),
+      contour_var = "count", 
+      #breaks = seq(50, 1000, by = 50), 
+      #adjust = 0.5, 
+      alpha = 0.8,
+      show.legend = TRUE
+    ) +
+  geom_label(aes(x = width/2, y = height - 2.5,
+                 label = "KDE Estimated Counts")) +
+  geom_text(aes(x = width/2, y = height - 3.5,
+                label = "Half of Default Bandwidths")) +
+  labs(
+    fill = "Counts"
+  ) +
+  lims(x= c(0, width), y = c(0, height)) +
+  theme(
+    legend.position = "right",
+    legend.title.align = 0.5
+  )
+```
+
+### Player Density Plots
+
+```{r}
+shots_threshold <- 175
+
+volume_shots <- function(data, min_shots){
+  qualified_players <- data %>%
+    group_by(player) %>%
+    summarise(
+      n_shots = n()
+    ) %>%
+    filter(n_shots >= min_shots) %>%
+    pull(player)
+  
+  qualified_shots <- data %>%
+    filter(player %in% qualified_players)
+  
+  return(qualified_shots)
+}
+
+qualified_shots <- volume_shots(data = shots_3000_tb, min_shots = shots_threshold)
+```
+
+Let's create normalized density plots for each player. Note that many players in the sample did not take enough shots to create meaningful plots so we will only include the players who took at least `r shots_threshold` shots. This can easily be achieved using the `facet_wrap(~player)` line of code.
+
+```{r density-facet, echo = TRUE, fig.cap = 'Different types of shot patterns indeed', out.width='100%', out.height='100%', fig.align='center'}
+# Density estimate, scaled to a maximum of 1.
+plot_court() +
+  geom_point(data = qualified_shots, aes(x = loc_x, y = loc_y),
+             size = 1, alpha = 0.2) +
+  geom_density_2d_filled(
+    data = qualified_shots,
+    aes(x = loc_x, y = loc_y, fill = ..level..),
+    contour_var = "ndensity", # normalize density
+    breaks = seq(0.2, 1.0, by = 0.1), # drop the lowest 
+    adjust = 0.5, # Half the default bandwidth
+    alpha = 0.8,
+    show.legend = FALSE
+  ) +
+  lims(x= c(0, width), y = c(0, height)) +
+  facet_wrap(~player)
+```
+
+These plots could be very useful to players and coaches. They tell you at a glance if the player is taking the bulk of their shots where you want them to take them. You can clearly see from Figure \@ref(fig:density-facet) above that players have different shooting patterns. Player takes many layups while Player 11 shoots more three-point attempts.
+
+Consider the [shiny application](https://olivier-chabot.shinyapps.io/density/) below that allows the user to filter the density plots based on the player and the type of shots. The application may be best viewed on a computer or on a tablet in a separate page.
+
+```{r density-shiny, fig.cap = 'You can acces the application [here](https://olivier-chabot.shinyapps.io/density/)!', out.width='100%', fig.align='center'}
+# https://bookdown.org/egarpor/NP-UC3M/kde-i-kde.html
+knitr::include_app("https://olivier-chabot.shinyapps.io/density/",
+  height = "1800px")
+```
+
+## Hot Spot Analysis
+
+So far, we have looked at where shots were likely to take place based on our sample data. The interesting question is:
+
+> __What regions of the court has the team shot most accurately?__
+
+The first thing we can do to try to answer this question is to create separate heatmaps for made and missed shots. 
+
+```{r made-miss-den, fig.cap = 'This is probably not going to be too informative.', out.width='100%', fig.align='center', echo = TRUE}
+# The density estimate
+plot_court() +
+  geom_point(data = shots_3000_tb, aes(x = loc_x, y = loc_y),
+             size = 0.5, alpha = 0.05) +
+  geom_density_2d_filled(
+      data = shots_3000_tb,
+      aes(x = loc_x, y = loc_y, fill = ..level..),
+      # Regular density
+      contour_var = "ndensity",
+      breaks = seq(0.1, 1.0, by = 0.1), # drop the lowest 
+      adjust = 0.5,
+      alpha = 0.8,
+      show.legend = FALSE
+    ) +
+  facet_wrap(vars(shot_made_factor))
+```
+
+```{r}
+missed <- shots_3000_tb %>%
+  filter(shot_made_factor == "Miss") %>% 
+  count() %>%
+  as.numeric()
+
+made <- shots_3000_tb %>%
+  filter(shot_made_factor == "Make") %>% 
+  count() %>%
+  as.numeric()
+
+fg_pct <- made / (missed + made)
+```
+
+It is important to keep in mind when looking at Figure \@ref(fig:made-miss-den) above that there were more missed shots (`r missed`) than made shots (`r made`). The overall shooting percentage was `r round(fg_pct*100, digits = 2)`%. We see that the made layups are more condensed around the rim than missed attempts. We also see that made layups were more common than made three-pointers. 
+
+Next, we can try to divide the densities of made shots by the densities of all shots to get an estimate of accuracy for every location on the floor. We will only focus on the grey region in Figure \@ref(fig:hot-window) below since there aren't enough shots in the other regions of the half-court.
+
+```{r hot-window, echo = FALSE, fig.cap = 'Observation window for our hot spot analysis', out.width='100%', fig.align='center'}
+plot_court() +
+  # Plot window
+  geom_sf(data = window_points, fill = "grey", alpha = 0.5) +
+  # Plot shots
+  geom_sf(data = shots_3000_sf, aes(color = shot_made_factor),
+          alpha = 0.1, size = 1) +
+  # Red = Miss, Green = Make
+  scale_color_manual(values = c("red", "green")) +
+  # Remove legend title
+  theme(legend.title = element_blank())
+```
+
+```{r, eval = FALSE}
+# # Define a point sfg object for the center of the hoop
+# hoop_center <- st_point(c(width/2, hoop_center_y))
+# 
+# # Create a circle with radius 9 and crop it to fit within the court
+# window_points <- st_crop(
+#   st_sfc(st_buffer(hoop_center, dist = 7.75)),
+#   xmin = 0, ymin = backboard_offset - backboard_thick,
+#   xmax = width, ymax = height
+# )
+# 
+# # Create a polygon sf object with the coordinates
+# window_points <- st_polygon(list(
+#   st_coordinates(window_points)[ , 1:2]
+#   ))
+# 
+# window_points <- half_court
+# 
+# # Define a window based on where the shots tend to take place
+# window <- as.owin(window_points)
+# 
+# # only keep the shots that are in the window
+# shots_window <- shots_3000_sf[window_points, ]
+# 
+# # Create a ppp object
+# shots_ppp <- ppp(
+#   x = st_coordinates(shots_window)[, 1],
+#   y = st_coordinates(shots_window)[, 2],
+#   window = window,
+#   marks = shots_window$shot_made_factor
+# )
+# 
+# shots_splits <- split(shots_ppp)
+# 
+# shot_densities <- density(shots_splits)
+# 
+# frac_shot_made_density <- shot_densities[[2]] / (shot_densities[[1]] + shot_densities[[2]])
+# 
+# plot(frac_shot_made_density)
+# contour(frac_shot_made_density)
+# 
+# 
+# 
+# hot_df <- data.frame(
+#   expand.grid(
+#   x = frac_shot_made_density$xcol,
+#   y = frac_shot_made_density$yrow
+#   ),
+#   z = as.vector(frac_shot_made_density$v)
+# )
+# 
+# plot_court() +
+#   geom_contour_filled(data = hot_df, aes(x = x, y = y, z = z), alpha = 0.6)
+```
+
+```{r, echo = TRUE}
+# only keep the shots that are in the window
+shots_window <- shots_3000_sf[window_points, ]
+
+# Create a ppp object
+shots_ppp <- ppp(
+  x = st_coordinates(shots_window)[, 1],
+  y = st_coordinates(shots_window)[, 2],
+  window = window,
+  marks = shots_window$shot_made_factor
+)
+
+shots_splits <- split(shots_ppp)
+
+shot_densities <- density(shots_splits)
+
+# Make / Total
+frac_shot_made_density <- shot_densities[[2]] / (shot_densities[[1]] + shot_densities[[2]])
+```
+
+```{r hot-heat, fig.cap = 'Some hot layups!', out.width='100%', fig.align='center'}
+plot(
+  frac_shot_made_density,
+  main = "",
+  xlab = "Horizontal",
+  ylab = "Vertical",
+  asp = 1
+  )
+
+contour(
+  frac_shot_made_density,
+  add = TRUE
+  )
+```
+
+Figure \@ref(fig:hot-heat) is difficult to read since we cannot see the court lines for reference below. That said, the shape of the window resembles the shape of the court enough that we can make some reasonable inferences from this plot. It is clear that layups have the highest accuracy at around 50%. The accuracy of the three-point shots in the sample hover around 35%. There might be some slight left-right differences in accuracy. 
+
+We will investigate further the accuracy of different spots on the floor in the interpolation chapter. Building models will allow us to get some uncertainty estimates for the predicted accuracy. With Figure \@ref(fig:hot-heat), we can be pretty certain that the accuracy of layups hover around 50% given the large number of attempts in this area. However, our accuracy estimates from the mid-range almost certainly has a large error given our sparse data. We will learn how we can use advanced machine learning techniques to address these issues.
+
+__Note that all the ```R``` code used in this book is accessible on [GitHub](https://github.com/olivierchabot17/ballbook).__
+
+
